@@ -1,23 +1,64 @@
 version: 2.1
 
-# Define the jobs we want to run for this project
-jobs:
-  build:
-    docker:
-      - image: cimg/base:2023.03
-    steps:
-      - checkout
-      - run: echo "this is the build job"
-  test:
-    docker:
-      - image: cimg/base:2023.03
-    steps:
-      - checkout
-      - run: echo "this is the test job"
+orbs:
+  lumper: loadsmart/lumper@4
+  sentinel: loadsmart/sentinel@1
 
-# Orchestrate our job run sequence
+jobs:
+  build-arm64-distroless:
+    machine:
+      image: ubuntu-2004:current
+      docker_layer_caching: true
+    resource_class: arm.medium
+    steps:
+      - checkout
+
+      - run:
+          name: Install Build Tools
+          command: |
+            sudo apt-get update
+            sudo apt-get install -y make gcc g++ curl dpkg-dev pkg-config libfido2-dev
+
+      - run:
+          name: Build Teleport Debian Package (arm64)
+          command: |
+            export GOCACHE="$(mktemp -d)"
+            make clean
+            make docker-binaries ARCH=arm64
+            make build-archive ARCH=arm64
+
+      - run:
+          name: Prepare Build Context
+          command: |
+            mkdir -p build/distroless
+            TELEPORT_VERSION=$(make print-version | tail -n1)
+            cp ./build.assets/charts/Dockerfile-distroless ./build/distroless/Dockerfile
+            cp teleport_${TELEPORT_VERSION}_arm64.deb ./build/distroless/
+            cp build.assets/fetch-debs ./build/distroless/
+            chmod +x ./build/distroless/fetch-debs
+
+      - run:
+          name: Build ARM64 Distroless Docker Image
+          command: |
+            TELEPORT_VERSION=$(make print-version | tail -n1)
+            docker buildx create --use || true
+            docker buildx inspect --bootstrap
+
+            docker buildx build \
+              --platform linux/arm64 \
+              --load \
+              --build-arg TELEPORT_VERSION=${TELEPORT_VERSION} \
+              --build-arg TELEPORT_RELEASE_INFIX= \
+              -t teleport:distroless-arm64 \
+              ./build/distroless
+
 workflows:
-  build_and_test:
+  build-and-push:
     jobs:
-      - build
-      - test
+      - build-arm64-distroless:
+          context: org-global
+
+  developer-productivity:
+    jobs:
+      - sentinel/default:
+          context: org-global
