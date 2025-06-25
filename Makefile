@@ -558,6 +558,7 @@ RDPCLIENT_SKIP_CARGO ?= 0
 rdpclient: rustup-toolchain-warning
 ifeq ("$(with_rdpclient)", "yes")
 ifneq ($(RDPCLIENT_SKIP_CARGO),1)
+	cargo clean
 	$(RDPCLIENT_ENV) \
 		cargo build -p rdp-client $(if $(FIPS),--features=fips) --release --locked $(CARGO_TARGET)
 else
