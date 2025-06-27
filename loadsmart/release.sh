@@ -6,7 +6,11 @@ if [[ $# -ne 1 ]]; then
   exit 1
 fi
 
-VERSION=v"$1"
+VERSION="$1"
+if [[ "${VERSION}" != v* ]]; then
+  VERSION="v${VERSION}"
+fi
+
 BRANCH="release/$VERSION"
 PATCH_FILE="loadsmart.patch"
 FILES_TO_PATCH=".circleci/config.yml Makefile build.assets/Makefile"
