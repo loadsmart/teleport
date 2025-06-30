@@ -392,6 +392,7 @@ endif
 .PHONY: rdpclient
 rdpclient:
 ifeq ("$(with_rdpclient)", "yes")
+	cargo clean
 	cargo build -p rdp-client $(if $(FIPS),--features=fips) --release --locked $(CARGO_TARGET)
 endif
 
@@ -1181,22 +1182,6 @@ ADDLICENSE_AGPL3_ARGS := $(ADDLICENSE_COMMON_ARGS) \
 ADDLICENSE_APACHE2_ARGS := $(ADDLICENSE_COMMON_ARGS) \
 		-l apache
 
-.PHONY: lint-license
-lint-license: $(ADDLICENSE)
-	$(ADDLICENSE) $(ADDLICENSE_AGPL3_ARGS) -check * 2>/dev/null
-	$(ADDLICENSE) $(ADDLICENSE_APACHE2_ARGS) -check api/* 2>/dev/null
-
-.PHONY: fix-license
-fix-license: $(ADDLICENSE)
-	$(ADDLICENSE) $(ADDLICENSE_AGPL3_ARGS) * 2>/dev/null
-	$(ADDLICENSE) $(ADDLICENSE_APACHE2_ARGS) api/* 2>/dev/null
-
-$(ADDLICENSE):
-	cd && go install github.com/google/addlicense@v1.0.0
-
-# This rule updates version files and Helm snapshots based on the Makefile
-# VERSION variable.
-#
 # Used prior to a release by bumping VERSION in this Makefile and then
 # running "make update-version".
 .PHONY: update-version
@@ -1653,7 +1638,7 @@ changelog:
 # does not match version set it will fail to create a release. If tag doesn't exist it
 # will also fail to create a release.
 #
-# For more information on release notes generation see: 
+# For more information on release notes generation see:
 #   https://github.com/gravitational/shared-workflows/tree/gus/release-notes/tools/release-notes#readme
 .PHONY: create-github-release
 create-github-release: LATEST = false
