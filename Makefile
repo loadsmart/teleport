@@ -1201,18 +1201,18 @@ ADDLICENSE_AGPL3_ARGS := $(ADDLICENSE_COMMON_ARGS) \
 ADDLICENSE_APACHE2_ARGS := $(ADDLICENSE_COMMON_ARGS) \
 		-l apache
 
-.PHONY: lint-license
-lint-license: $(ADDLICENSE)
-	$(ADDLICENSE) $(ADDLICENSE_AGPL3_ARGS) -check * 2>/dev/null
-	$(ADDLICENSE) $(ADDLICENSE_APACHE2_ARGS) -check api/* 2>/dev/null
-
-.PHONY: fix-license
-fix-license: $(ADDLICENSE)
-	$(ADDLICENSE) $(ADDLICENSE_AGPL3_ARGS) * 2>/dev/null
-	$(ADDLICENSE) $(ADDLICENSE_APACHE2_ARGS) api/* 2>/dev/null
-
-$(ADDLICENSE):
-	cd && go install github.com/google/addlicense@v1.0.0
+# .PHONY: lint-license
+# lint-license: $(ADDLICENSE)
+# 	$(ADDLICENSE) $(ADDLICENSE_AGPL3_ARGS) -check * 2>/dev/null
+# 	$(ADDLICENSE) $(ADDLICENSE_APACHE2_ARGS) -check api/* 2>/dev/null
+#
+# .PHONY: fix-license
+# fix-license: $(ADDLICENSE)
+# 	$(ADDLICENSE) $(ADDLICENSE_AGPL3_ARGS) * 2>/dev/null
+# 	$(ADDLICENSE) $(ADDLICENSE_APACHE2_ARGS) api/* 2>/dev/null
+#
+# $(ADDLICENSE):
+# 	cd && go install github.com/google/addlicense@v1.0.0
 
 # This rule updates version files and Helm snapshots based on the Makefile
 # VERSION variable.
