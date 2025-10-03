@@ -13,7 +13,7 @@ fi
 
 BRANCH="release/$VERSION"
 PATCH_FILE="loadsmart.patch"
-FILES_TO_PATCH=".circleci/config.yml Makefile build.assets/Makefile"
+FILES_TO_PATCH=".circleci/config.yml Makefile build.assets/Makefile build.assets/charts/Dockerfile-distroless"
 UPSTREAM_URL="https://github.com/gravitational/teleport.git"
 
 cd "$(git rev-parse --show-toplevel)"
