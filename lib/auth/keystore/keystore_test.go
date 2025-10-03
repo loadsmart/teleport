@@ -26,7 +26,13 @@ import (
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/sha256"
+	"crypto/x509"
 	"errors"
+	"fmt"
+	"os"
+	"os/exec"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -44,7 +50,7 @@ import (
 	"github.com/gravitational/teleport/lib/service/servicecfg"
 	"github.com/gravitational/teleport/lib/services"
 	"github.com/gravitational/teleport/lib/tlsca"
-	"github.com/gravitational/teleport/lib/utils"
+	"github.com/gravitational/teleport/lib/utils/log/logtest"
 )
 
 const (
@@ -217,13 +223,17 @@ func TestBackends(t *testing.T) {
 				publicKeys[i] = signer.Public()
 			}
 
+			// generate an encryption key that should not be cleaned up
+			encryptionKey, decrypter, hash, err := backend.generateDecrypter(ctx, cryptosuites.RSA4096)
+			require.NoError(t, err)
+
 			// AWS KMS keystore will not delete any keys created in the past 5
 			// minutes.
 			pack.clock.Advance(6 * time.Minute)
 
 			// say that only the first key is in use, delete the rest
 			usedKeys := [][]byte{rawPrivateKeys[0]}
-			err := backend.deleteUnusedKeys(ctx, usedKeys)
+			err = backend.deleteUnusedKeys(ctx, usedKeys)
 			require.NoError(t, err, trace.DebugReport(err))
 
 			// make sure the first key is still good
@@ -231,6 +241,23 @@ func TestBackends(t *testing.T) {
 			require.NoError(t, err)
 			_, err = signer.Sign(rand.Reader, messageHash[:], crypto.SHA256)
 			require.NoError(t, err)
+
+			// make sure the encryption key is still good
+			plaintext := "test message"
+			pubKey, ok := decrypter.Public().(*rsa.PublicKey)
+			require.True(t, ok, "expected *rsa.PublicKey, got %T", decrypter.Public())
+
+			cipher, err := rsa.EncryptOAEP(hash.New(), rand.Reader, pubKey, []byte(plaintext), nil)
+			require.NoError(t, err)
+
+			decrypter, err = backend.getDecrypter(ctx, encryptionKey, decrypter.Public(), hash)
+			require.NoError(t, err)
+
+			decrypted, err := decrypter.Decrypt(rand.Reader, cipher, &rsa.OAEPOptions{
+				Hash: hash,
+			})
+			require.NoError(t, err)
+			require.Equal(t, plaintext, string(decrypted))
 
 			// make sure all other keys are deleted
 			for i := 1; i < numKeys; i++ {
@@ -344,14 +371,18 @@ func TestManager(t *testing.T) {
 			require.Equal(t, jwtKeyPair.PublicKey, pubkeyPem)
 
 			decrypter, err := manager.GetDecrypter(ctx, encKeyPair)
-
 			require.NoError(t, err)
 			require.NotNil(t, decrypter)
 
 			// Try encrypting and decrypting some data
 			msg := []byte("teleport")
 			require.NoError(t, err)
-			ciphertext, err := encKeyPair.EncryptOAEP(msg)
+			pubKey, err := x509.ParsePKIXPublicKey(encKeyPair.PublicKey)
+			require.NoError(t, err)
+			pubKeyRSA, ok := pubKey.(*rsa.PublicKey)
+			require.True(t, ok, "expected RSA public key")
+
+			ciphertext, err := rsa.EncryptOAEP(crypto.Hash(encKeyPair.Hash).New(), rand.Reader, pubKeyRSA, msg, nil)
 			require.NoError(t, err)
 
 			plaintext, err := decrypter.Decrypt(rand.Reader, ciphertext, nil)
@@ -545,7 +576,7 @@ func newTestPack(ctx context.Context, t *testing.T) *testPack {
 	var backends []*backendDesc
 
 	hostUUID := uuid.NewString()
-	logger := utils.NewSlogLoggerForTests()
+	logger := logtest.NewLogger()
 
 	unusedPKCS11Key, err := keyID{
 		HostID: hostUUID,
@@ -574,9 +605,21 @@ func newTestPack(ctx context.Context, t *testing.T) *testPack {
 		},
 		kmsClient:         testGCPKMSClient,
 		clockworkOverride: clock,
+		RSAKeyPairSource: func(alg cryptosuites.Algorithm) ([]byte, []byte, error) {
+			switch alg {
+			case cryptosuites.RSA2048:
+				return testRSA2048PrivateKeyPEM, nil, nil
+			case cryptosuites.RSA4096:
+				return testRSA4096PrivateKeyPEM, nil, nil
+			}
+
+			return nil, nil, trace.Errorf("unexpected algorithm: %v", alg)
+		},
 	}
 
-	softwareBackend := newSoftwareKeyStore(&softwareConfig{})
+	softwareBackend := newSoftwareKeyStore(&softwareConfig{
+		rsaKeyPairSource: baseOpts.RSAKeyPairSource,
+	})
 	backends = append(backends, &backendDesc{
 		name:                "software",
 		config:              servicecfg.KeystoreConfig{},
@@ -602,7 +645,7 @@ func newTestPack(ctx context.Context, t *testing.T) *testPack {
 		})
 	}
 
-	if config, ok := yubiHSMTestConfig(t); ok {
+	if config, ok := yubiHSMTestConfig(); ok {
 		backend, err := newPKCS11KeyStore(&config.PKCS11, &baseOpts)
 		require.NoError(t, err)
 		backends = append(backends, &backendDesc{
@@ -615,7 +658,7 @@ func newTestPack(ctx context.Context, t *testing.T) *testPack {
 		})
 	}
 
-	if config, ok := cloudHSMTestConfig(t); ok {
+	if config, ok := cloudHSMTestConfig(); ok {
 		backend, err := newPKCS11KeyStore(&config.PKCS11, &baseOpts)
 		require.NoError(t, err)
 		backends = append(backends, &backendDesc{
@@ -629,7 +672,7 @@ func newTestPack(ctx context.Context, t *testing.T) *testPack {
 	}
 
 	// Test with real GCP account if environment is enabled.
-	if config, ok := gcpKMSTestConfig(t); ok {
+	if config, ok := gcpKMSTestConfig(); ok {
 		opts := baseOpts
 		opts.kmsClient = nil
 
@@ -669,7 +712,7 @@ func newTestPack(ctx context.Context, t *testing.T) *testPack {
 	// Test AWS with and without multi-region keys
 	for _, multiRegion := range []bool{false, true} {
 		// Test with real AWS account if environment is enabled.
-		if config, ok := awsKMSTestConfig(t); ok {
+		if config, ok := awsKMSTestConfig(); ok {
 			config.AWSKMS.MultiRegion.Enabled = multiRegion
 			opts := baseOpts
 			// Unset the fake clients so this test can use the real AWS clients.
@@ -742,4 +785,158 @@ func newTestPack(ctx context.Context, t *testing.T) *testPack {
 		backends: backends,
 		clock:    clock,
 	}
+}
+
+func HSMTestConfig(t *testing.T) servicecfg.KeystoreConfig {
+	if cfg, ok := yubiHSMTestConfig(); ok {
+		t.Log("Running test with YubiHSM")
+		return cfg
+	}
+	if cfg, ok := cloudHSMTestConfig(); ok {
+		t.Log("Running test with AWS CloudHSM")
+		return cfg
+	}
+	if cfg, ok := awsKMSTestConfig(); ok {
+		t.Log("Running test with AWS KMS")
+		return cfg
+	}
+	if cfg, ok := gcpKMSTestConfig(); ok {
+		t.Log("Running test with GCP KMS")
+		return cfg
+	}
+	if cfg, ok := softHSMTestConfig(t); ok {
+		t.Log("Running test with SoftHSM")
+		return cfg
+	}
+	t.Skip("No HSM available for test")
+	return servicecfg.KeystoreConfig{}
+}
+
+func yubiHSMTestConfig() (servicecfg.KeystoreConfig, bool) {
+	yubiHSMPath := os.Getenv("TELEPORT_TEST_YUBIHSM_PKCS11_PATH")
+	yubiHSMPin := os.Getenv("TELEPORT_TEST_YUBIHSM_PIN")
+	if yubiHSMPath == "" || yubiHSMPin == "" {
+		return servicecfg.KeystoreConfig{}, false
+	}
+	slotNumber := 0
+	return servicecfg.KeystoreConfig{
+		PKCS11: servicecfg.PKCS11Config{
+			Path:       yubiHSMPath,
+			SlotNumber: &slotNumber,
+			PIN:        yubiHSMPin,
+		},
+	}, true
+}
+
+func cloudHSMTestConfig() (servicecfg.KeystoreConfig, bool) {
+	cloudHSMPin := os.Getenv("TELEPORT_TEST_CLOUDHSM_PIN")
+	if cloudHSMPin == "" {
+		return servicecfg.KeystoreConfig{}, false
+	}
+	return servicecfg.KeystoreConfig{
+		PKCS11: servicecfg.PKCS11Config{
+			Path:       "/opt/cloudhsm/lib/libcloudhsm_pkcs11.so",
+			TokenLabel: "cavium",
+			PIN:        cloudHSMPin,
+		},
+	}, true
+}
+
+func awsKMSTestConfig() (servicecfg.KeystoreConfig, bool) {
+	awsKMSAccount := os.Getenv("TELEPORT_TEST_AWS_KMS_ACCOUNT")
+	awsKMSRegion := os.Getenv("TELEPORT_TEST_AWS_KMS_REGION")
+	if awsKMSAccount == "" || awsKMSRegion == "" {
+		return servicecfg.KeystoreConfig{}, false
+	}
+	return servicecfg.KeystoreConfig{
+		AWSKMS: &servicecfg.AWSKMSConfig{
+			AWSAccount: awsKMSAccount,
+			AWSRegion:  awsKMSRegion,
+		},
+	}, true
+}
+
+func gcpKMSTestConfig() (servicecfg.KeystoreConfig, bool) {
+	gcpKeyring := os.Getenv("TELEPORT_TEST_GCP_KMS_KEYRING")
+	if gcpKeyring == "" {
+		return servicecfg.KeystoreConfig{}, false
+	}
+	return servicecfg.KeystoreConfig{
+		GCPKMS: servicecfg.GCPKMSConfig{
+			KeyRing:         gcpKeyring,
+			ProtectionLevel: "SOFTWARE",
+		},
+	}, true
+}
+
+var (
+	cachedSoftHSMConfig      *servicecfg.KeystoreConfig
+	cachedSoftHSMConfigMutex sync.Mutex
+)
+
+// softHSMTestConfig is for use in tests only and creates a test SOFTHSM2 token.
+// This should be used for all tests which need to use SoftHSM because the
+// library can only be initialized once and SOFTHSM2_PATH and SOFTHSM2_CONF
+// cannot be changed. New tokens added after the library has been initialized
+// will not be found by the library.
+//
+// A new token will be used for each `go test` invocation, but it's difficult
+// to create a separate token for each test because because new tokens
+// added after the library has been initialized will not be found by the
+// library. It's also difficult to clean up the token because tests for all
+// packages are run in parallel there is not a good time to safely
+// delete the token or the entire token directory. Each test should clean up
+// all keys that it creates because SoftHSM2 gets really slow when there are
+// many keys for a given token.
+func softHSMTestConfig(t *testing.T) (servicecfg.KeystoreConfig, bool) {
+	path := os.Getenv("SOFTHSM2_PATH")
+	if path == "" {
+		return servicecfg.KeystoreConfig{}, false
+	}
+
+	cachedSoftHSMConfigMutex.Lock()
+	defer cachedSoftHSMConfigMutex.Unlock()
+
+	if cachedSoftHSMConfig != nil {
+		return *cachedSoftHSMConfig, true
+	}
+
+	if os.Getenv("SOFTHSM2_CONF") == "" {
+		// create tokendir
+		tokenDir, err := os.MkdirTemp("", "tokens")
+		require.NoError(t, err)
+
+		// create config file
+		configFile, err := os.CreateTemp("", "softhsm2.conf")
+		require.NoError(t, err)
+
+		// write config file
+		_, err = fmt.Fprintf(configFile, "directories.tokendir = %s\nobjectstore.backend = file\nlog.level = DEBUG\n", tokenDir)
+		require.NoError(t, err)
+		require.NoError(t, configFile.Close())
+
+		// set env
+		os.Setenv("SOFTHSM2_CONF", configFile.Name())
+	}
+
+	// create test token (max length is 32 chars)
+	tokenLabel := strings.ReplaceAll(uuid.NewString(), "-", "")
+	cmd := exec.Command("softhsm2-util", "--init-token", "--free", "--label", tokenLabel, "--so-pin", "password", "--pin", "password")
+	t.Logf("Running command: %q", cmd)
+	if err := cmd.Run(); err != nil {
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) {
+			require.NoError(t, exitErr, "error creating test softhsm token: %s", string(exitErr.Stderr))
+		}
+		require.NoError(t, err, "error attempting to run softhsm2-util")
+	}
+
+	cachedSoftHSMConfig = &servicecfg.KeystoreConfig{
+		PKCS11: servicecfg.PKCS11Config{
+			Path:       path,
+			TokenLabel: tokenLabel,
+			PIN:        "password",
+		},
+	}
+	return *cachedSoftHSMConfig, true
 }

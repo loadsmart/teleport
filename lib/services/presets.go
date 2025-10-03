@@ -34,7 +34,7 @@ import (
 	"github.com/gravitational/teleport/api/types"
 	apiutils "github.com/gravitational/teleport/api/utils"
 	"github.com/gravitational/teleport/lib/modules"
-	"github.com/gravitational/teleport/lib/utils"
+	"github.com/gravitational/teleport/lib/utils/set"
 )
 
 // NewSystemAutomaticAccessApproverRole creates a new Role that is allowed to
@@ -218,6 +218,9 @@ func NewPresetEditorRole() types.Role {
 					types.NewRule(types.KindSigstorePolicy, RW()),
 					types.NewRule(types.KindWorkloadIdentityX509IssuerOverride, RW()),
 					types.NewRule(types.KindWorkloadIdentityX509IssuerOverrideCSR, RW()),
+					types.NewRule(types.KindInferenceModel, RW()),
+					types.NewRule(types.KindInferenceSecret, RW()),
+					types.NewRule(types.KindInferencePolicy, RW()),
 				},
 			},
 		},
@@ -593,6 +596,76 @@ func NewPresetWildcardWorkloadIdentityIssuerRole() types.Role {
 	return role
 }
 
+// NewPresetAccessPluginRole returns a new pre-defined role for self-hosted
+// access request plugins.
+func NewPresetAccessPluginRole() types.Role {
+	role := &types.RoleV6{
+		Kind:    types.KindRole,
+		Version: types.V7,
+		Metadata: types.Metadata{
+			Name:        teleport.PresetAccessPluginRoleName,
+			Namespace:   apidefaults.Namespace,
+			Description: "Default access plugin role",
+			Labels: map[string]string{
+				types.TeleportInternalResourceType: types.PresetResource,
+			},
+		},
+		Spec: types.RoleSpecV6{
+			Allow: types.RoleConditions{
+				Rules: []types.Rule{
+					types.NewRule(types.KindAccessRequest, RO()),
+					types.NewRule(types.KindAccessPluginData, RW()),
+					types.NewRule(types.KindAccessMonitoringRule, RO()),
+					types.NewRule(types.KindAccessList, RO()),
+					types.NewRule(types.KindRole, RO()),
+					types.NewRule(types.KindUser, RO()),
+				},
+				ReviewRequests: &types.AccessReviewConditions{
+					PreviewAsRoles: []string{
+						teleport.PresetListAccessRequestResourcesRoleName,
+					},
+				},
+			},
+		},
+	}
+	return role
+}
+
+// NewPresetListAccessRequestResourcesRole returns a new pre-defined role that
+// allows reading access request resources.
+func NewPresetListAccessRequestResourcesRole() types.Role {
+	role := &types.RoleV6{
+		Kind:    types.KindRole,
+		Version: types.V7,
+		Metadata: types.Metadata{
+			Name:        teleport.PresetListAccessRequestResourcesRoleName,
+			Namespace:   apidefaults.Namespace,
+			Description: "Default list access request resources role",
+			Labels: map[string]string{
+				types.TeleportInternalResourceType: types.PresetResource,
+			},
+		},
+		Spec: types.RoleSpecV6{
+			Allow: types.RoleConditions{
+				Rules: []types.Rule{
+					types.NewRule(types.KindNode, RO()),
+					types.NewRule(types.KindApp, RO()),
+					types.NewRule(types.KindDatabase, RO()),
+					types.NewRule(types.KindKubernetesCluster, RO()),
+				},
+				// To enable all access plugin features, the role requires read
+				// access to all of the following resources.
+				AppLabels:        types.Labels{types.Wildcard: []string{types.Wildcard}},
+				DatabaseLabels:   types.Labels{types.Wildcard: []string{types.Wildcard}},
+				GroupLabels:      types.Labels{types.Wildcard: []string{types.Wildcard}},
+				KubernetesLabels: types.Labels{types.Wildcard: []string{types.Wildcard}},
+				NodeLabels:       types.Labels{types.Wildcard: []string{types.Wildcard}},
+			},
+		},
+	}
+	return role
+}
+
 // SystemOktaAccessRoleName is the name of the system role that allows
 // access to Okta resources. This will be used by the Okta requester role to
 // search for Okta resources.
@@ -752,6 +825,34 @@ func NewPresetTerraformProviderRole() types.Role {
 	return role
 }
 
+// NewPresetMCPUserRole returns a new pre-defined role for accessing MCP
+// servers.
+func NewPresetMCPUserRole() types.Role {
+	role := &types.RoleV6{
+		Kind:    types.KindRole,
+		Version: types.V8,
+		Metadata: types.Metadata{
+			Name:        teleport.PresetMCPUserRoleName,
+			Namespace:   apidefaults.Namespace,
+			Description: "Access to MCP servers",
+			Labels: map[string]string{
+				types.TeleportInternalResourceType: types.PresetResource,
+			},
+		},
+		Spec: types.RoleSpecV6{
+			Allow: types.RoleConditions{
+				AppLabels: map[string]apiutils.Strings{
+					types.AppSubKindLabel: []string{types.SubKindMCP},
+				},
+				MCP: &types.MCPPermissions{
+					Tools: []string{types.Wildcard},
+				},
+			},
+		},
+	}
+	return role
+}
+
 // NewPresetHealthCheckConfig returns a preset default health_check_config that
 // enables health checks for all resources.
 func NewPresetHealthCheckConfig() *healthcheckconfigv1.HealthCheckConfig {
@@ -800,16 +901,19 @@ func bootstrapRoleMetadataLabels() map[string]map[string]string {
 		teleport.SystemIdentityCenterAccessRoleName: {
 			types.TeleportInternalResourceType: types.SystemResource,
 		},
-		// Group access, reviewer and requester are intentionally not added here as there may be
-		// existing customer defined roles that have these labels.
+		// These roles are intentionally not added here as there may be existing
+		// customer defined roles that have these labels:
+		// group-access, reviewer, requester, mcp-user
 	}
 }
 
 var defaultAllowRulesMap = map[string][]types.Rule{
-	teleport.PresetAuditorRoleName:           NewPresetAuditorRole().GetRules(types.Allow),
-	teleport.PresetEditorRoleName:            NewPresetEditorRole().GetRules(types.Allow),
-	teleport.PresetAccessRoleName:            NewPresetAccessRole().GetRules(types.Allow),
-	teleport.PresetTerraformProviderRoleName: NewPresetTerraformProviderRole().GetRules(types.Allow),
+	teleport.PresetAuditorRoleName:                    NewPresetAuditorRole().GetRules(types.Allow),
+	teleport.PresetEditorRoleName:                     NewPresetEditorRole().GetRules(types.Allow),
+	teleport.PresetAccessRoleName:                     NewPresetAccessRole().GetRules(types.Allow),
+	teleport.PresetTerraformProviderRoleName:          NewPresetTerraformProviderRole().GetRules(types.Allow),
+	teleport.PresetAccessPluginRoleName:               NewPresetAccessPluginRole().GetRules(types.Allow),
+	teleport.PresetListAccessRequestResourcesRoleName: NewPresetListAccessRequestResourcesRole().GetRules(types.Allow),
 }
 
 // defaultAllowRules has the Allow rules that should be set as default when
@@ -839,6 +943,13 @@ func defaultAllowLabels(enterprise bool) map[string]types.RoleConditions {
 			DatabaseLabels:       wildcardLabels,
 			NodeLabels:           wildcardLabels,
 			WindowsDesktopLabels: wildcardLabels,
+		},
+		teleport.PresetListAccessRequestResourcesRoleName: {
+			AppLabels:        wildcardLabels,
+			DatabaseLabels:   wildcardLabels,
+			GroupLabels:      wildcardLabels,
+			KubernetesLabels: wildcardLabels,
+			NodeLabels:       wildcardLabels,
 		},
 	}
 
@@ -954,7 +1065,7 @@ func AddRoleDefaults(ctx context.Context, role types.Role) (types.Role, error) {
 	// Check if the role has a TeleportInternalResourceType attached. We do this after setting the role metadata
 	// labels because we set the role metadata labels for roles that have been well established (access,
 	// editor, auditor) that may not already have this label set, but we don't set it for newer roles
-	// (group-access, reviewer, requester) that may have customer definitions.
+	// (group-access, reviewer, requester, mcp-user) that may have customer definitions.
 	resourceType := labels[types.TeleportInternalResourceType]
 	if resourceType != types.PresetResource && resourceType != types.SystemResource {
 		return nil, trace.AlreadyExists("not modifying user created role")
@@ -993,6 +1104,7 @@ func AddRoleDefaults(ctx context.Context, role types.Role) (types.Role, error) {
 			types.KindNode,
 			types.KindUserGroup,
 			types.KindWindowsDesktop,
+			types.KindKubernetesCluster,
 		} {
 			var labels types.Labels
 			switch kind {
@@ -1008,6 +1120,8 @@ func AddRoleDefaults(ctx context.Context, role types.Role) (types.Role, error) {
 				labels = defaultLabels.GroupLabels
 			case types.KindWindowsDesktop:
 				labels = defaultLabels.WindowsDesktopLabels
+			case types.KindKubernetesCluster:
+				labels = defaultLabels.KubernetesLabels
 			}
 			labelsUpdated, err := updateAllowLabels(role, kind, labels)
 			if err != nil {
@@ -1064,7 +1178,7 @@ func AddRoleDefaults(ctx context.Context, role types.Role) (types.Role, error) {
 }
 
 func mergeStrings(dst, src []string) (merged []string, changed bool) {
-	items := utils.NewSet[string](dst...)
+	items := set.New[string](dst...)
 	items.Add(src...)
 	if len(items) == len(dst) {
 		return dst, false

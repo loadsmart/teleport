@@ -32,13 +32,12 @@ import (
 	"crypto/rand"
 	"crypto/subtle"
 	"crypto/x509"
+	"encoding/base32"
 	"encoding/pem"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
-	"maps"
-	"math/big"
 	mathrand "math/rand/v2"
 	"net"
 	"os"
@@ -72,6 +71,7 @@ import (
 	headerv1 "github.com/gravitational/teleport/api/gen/proto/go/teleport/header/v1"
 	mfav1 "github.com/gravitational/teleport/api/gen/proto/go/teleport/mfa/v1"
 	notificationsv1 "github.com/gravitational/teleport/api/gen/proto/go/teleport/notifications/v1"
+	scopesv1 "github.com/gravitational/teleport/api/gen/proto/go/teleport/scopes/v1"
 	workloadidentityv1pb "github.com/gravitational/teleport/api/gen/proto/go/teleport/workloadidentity/v1"
 	"github.com/gravitational/teleport/api/internalutils/stream"
 	"github.com/gravitational/teleport/api/metadata"
@@ -81,6 +81,7 @@ import (
 	apievents "github.com/gravitational/teleport/api/types/events"
 	"github.com/gravitational/teleport/api/types/wrappers"
 	apiutils "github.com/gravitational/teleport/api/utils"
+	"github.com/gravitational/teleport/api/utils/clientutils"
 	"github.com/gravitational/teleport/api/utils/keys"
 	"github.com/gravitational/teleport/api/utils/keys/hardwarekey"
 	"github.com/gravitational/teleport/api/utils/retryutils"
@@ -92,6 +93,7 @@ import (
 	"github.com/gravitational/teleport/lib/auth/machineid/workloadidentityv1"
 	"github.com/gravitational/teleport/lib/auth/okta"
 	"github.com/gravitational/teleport/lib/auth/recordingencryption"
+	"github.com/gravitational/teleport/lib/auth/summarizer"
 	"github.com/gravitational/teleport/lib/auth/userloginstate"
 	wanlib "github.com/gravitational/teleport/lib/auth/webauthn"
 	wantypes "github.com/gravitational/teleport/lib/auth/webauthntypes"
@@ -113,6 +115,8 @@ import (
 	"github.com/gravitational/teleport/lib/gitlab"
 	"github.com/gravitational/teleport/lib/integrations/awsra/createsession"
 	"github.com/gravitational/teleport/lib/inventory"
+	iterstream "github.com/gravitational/teleport/lib/itertools/stream"
+	joinboundkeypair "github.com/gravitational/teleport/lib/join/boundkeypair"
 	kubetoken "github.com/gravitational/teleport/lib/kube/token"
 	"github.com/gravitational/teleport/lib/limiter"
 	"github.com/gravitational/teleport/lib/loginrule"
@@ -121,6 +125,8 @@ import (
 	"github.com/gravitational/teleport/lib/observability/tracing"
 	"github.com/gravitational/teleport/lib/release"
 	"github.com/gravitational/teleport/lib/resourceusage"
+	"github.com/gravitational/teleport/lib/scopes"
+	scopedaccesscache "github.com/gravitational/teleport/lib/scopes/cache/access"
 	"github.com/gravitational/teleport/lib/service/servicecfg"
 	"github.com/gravitational/teleport/lib/services"
 	"github.com/gravitational/teleport/lib/services/local"
@@ -136,6 +142,7 @@ import (
 	"github.com/gravitational/teleport/lib/utils"
 	"github.com/gravitational/teleport/lib/utils/interval"
 	logutils "github.com/gravitational/teleport/lib/utils/log"
+	"github.com/gravitational/teleport/lib/utils/set"
 	vc "github.com/gravitational/teleport/lib/versioncontrol"
 	"github.com/gravitational/teleport/lib/versioncontrol/github"
 	uw "github.com/gravitational/teleport/lib/versioncontrol/upgradewindow"
@@ -187,8 +194,15 @@ var ErrRequiresEnterprise = services.ErrRequiresEnterprise
 type ServerOption func(*Server) error
 
 // NewServer creates and configures a new Server instance
-func NewServer(cfg *InitConfig, opts ...ServerOption) (*Server, error) {
-	err := metrics.RegisterPrometheusCollectors(prometheusCollectors...)
+func NewServer(cfg *InitConfig, opts ...ServerOption) (as *Server, err error) {
+	closeCtx, cancelFunc := context.WithCancel(context.TODO())
+	defer func() {
+		if err != nil {
+			cancelFunc()
+		}
+	}()
+
+	err = metrics.RegisterPrometheusCollectors(prometheusCollectors...)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
@@ -255,12 +269,13 @@ func NewServer(cfg *InitConfig, opts ...ServerOption) (*Server, error) {
 			return nil, trace.Wrap(err)
 		}
 
-		recordingEncryptionManager, err := recordingencryption.NewManager(recordingencryption.ManagerConfig{
-			Backend:       localRecordingEncryption,
-			Cache:         localRecordingEncryption,
-			ClusterConfig: cfg.ClusterConfiguration,
-			KeyStore:      cfg.KeyStore,
-			Logger:        cfg.Logger,
+		recordingEncryptionManager, err := recordingencryption.NewManager(closeCtx, recordingencryption.ManagerConfig{
+			Backend:                       localRecordingEncryption,
+			Cache:                         localRecordingEncryption,
+			ClusterConfig:                 cfg.ClusterConfiguration,
+			KeyStore:                      cfg.KeyStore,
+			Logger:                        cfg.Logger,
+			InitialSessionRecordingConfig: cfg.SessionRecordingConfig,
 			LockConfig: backend.RunWhileLockedConfig{
 				LockConfiguration: backend.LockConfiguration{
 					Backend:            cfg.Backend,
@@ -270,7 +285,7 @@ func NewServer(cfg *InitConfig, opts ...ServerOption) (*Server, error) {
 			},
 		})
 		if err != nil {
-			return nil, trace.Wrap(err)
+			return nil, trace.Wrap(err, "initializing session recording encryption")
 		}
 
 		cfg.RecordingEncryption = recordingEncryptionManager
@@ -471,6 +486,16 @@ func NewServer(cfg *InitConfig, opts ...ServerOption) (*Server, error) {
 		}
 		cfg.WorkloadIdentity = workloadIdentity
 	}
+	if cfg.Summarizer == nil {
+		summarizer, err := local.NewSummarizerService(cfg.Backend)
+		if err != nil {
+			return nil, trace.Wrap(err, "creating Summarizer service")
+		}
+		cfg.Summarizer = summarizer
+	}
+	if cfg.SessionSummarizerProvider == nil {
+		cfg.SessionSummarizerProvider = summarizer.NewSessionSummarizerProvider()
+	}
 	if cfg.WorkloadIdentityX509Revocations == nil {
 		cfg.WorkloadIdentityX509Revocations, err = local.NewWorkloadIdentityX509RevocationService(cfg.Backend)
 		if err != nil {
@@ -512,6 +537,9 @@ func NewServer(cfg *InitConfig, opts ...ServerOption) (*Server, error) {
 			return nil, trace.Wrap(err, "creating VnetConfigService")
 		}
 	}
+	if cfg.ScopedAccess == nil {
+		cfg.ScopedAccess = local.NewScopedAccessService(cfg.Backend)
+	}
 
 	if cfg.Logger == nil {
 		cfg.Logger = slog.With(teleport.ComponentKey, teleport.ComponentAuth)
@@ -540,7 +568,14 @@ func NewServer(cfg *InitConfig, opts ...ServerOption) (*Server, error) {
 		}
 	}
 
-	closeCtx, cancelFunc := context.WithCancel(context.TODO())
+	scopedAccessCache, err := scopedaccesscache.NewCache(scopedaccesscache.CacheConfig{
+		Events: cfg.Events,
+		Reader: cfg.ScopedAccess,
+	})
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+
 	services := &Services{
 		TrustInternal:                   cfg.Trust,
 		PresenceInternal:                cfg.Presence,
@@ -551,7 +586,7 @@ func NewServer(cfg *InitConfig, opts ...ServerOption) (*Server, error) {
 		ClusterConfigurationInternal:    cfg.ClusterConfiguration,
 		AutoUpdateService:               cfg.AutoUpdateService,
 		Restrictions:                    cfg.Restrictions,
-		Apps:                            cfg.Apps,
+		Applications:                    cfg.Apps,
 		Kubernetes:                      cfg.Kubernetes,
 		Databases:                       cfg.Databases,
 		DatabaseServices:                cfg.DatabaseServices,
@@ -598,31 +633,35 @@ func NewServer(cfg *InitConfig, opts ...ServerOption) (*Server, error) {
 		VnetConfigService:               cfg.VnetConfigService,
 		RecordingEncryptionManager:      cfg.RecordingEncryption,
 		MultipartHandler:                cfg.MultipartHandler,
+		Summarizer:                      cfg.Summarizer,
 	}
 
-	as := Server{
-		bk:                      cfg.Backend,
-		clock:                   cfg.Clock,
-		limiter:                 limiter,
-		Authority:               cfg.Authority,
-		AuthServiceName:         cfg.AuthServiceName,
-		ServerID:                cfg.HostUUID,
-		cancelFunc:              cancelFunc,
-		closeCtx:                closeCtx,
-		emitter:                 cfg.Emitter,
-		Streamer:                cfg.Streamer,
-		Unstable:                local.NewUnstableService(cfg.Backend, cfg.AssertionReplayService),
-		Services:                services,
-		Cache:                   services,
-		keyStore:                cfg.KeyStore,
-		traceClient:             cfg.TraceClient,
-		fips:                    cfg.FIPS,
-		loadAllCAs:              cfg.LoadAllCAs,
-		httpClientForAWSSTS:     cfg.HTTPClientForAWSSTS,
-		accessMonitoringEnabled: cfg.AccessMonitoringEnabled,
-		logger:                  cfg.Logger,
+	as = &Server{
+		bk:                        cfg.Backend,
+		clock:                     cfg.Clock,
+		limiter:                   limiter,
+		Authority:                 cfg.Authority,
+		AuthServiceName:           cfg.AuthServiceName,
+		ServerID:                  cfg.HostUUID,
+		cancelFunc:                cancelFunc,
+		closeCtx:                  closeCtx,
+		emitter:                   cfg.Emitter,
+		Streamer:                  cfg.Streamer,
+		Unstable:                  local.NewUnstableService(cfg.Backend, cfg.AssertionReplayService),
+		Services:                  services,
+		Cache:                     services,
+		scopedAccessBackend:       cfg.ScopedAccess,
+		ScopedAccessCache:         scopedAccessCache,
+		keyStore:                  cfg.KeyStore,
+		traceClient:               cfg.TraceClient,
+		fips:                      cfg.FIPS,
+		loadAllCAs:                cfg.LoadAllCAs,
+		httpClientForAWSSTS:       cfg.HTTPClientForAWSSTS,
+		accessMonitoringEnabled:   cfg.AccessMonitoringEnabled,
+		logger:                    cfg.Logger,
+		sessionSummarizerProvider: cfg.SessionSummarizerProvider,
 	}
-	as.inventory = inventory.NewController(&as, services,
+	as.inventory = inventory.NewController(as, services,
 		inventory.WithAuthServerID(cfg.HostUUID),
 		inventory.WithClock(cfg.Clock),
 		inventory.WithOnConnect(func(s string) {
@@ -642,7 +681,7 @@ func NewServer(cfg *InitConfig, opts ...ServerOption) (*Server, error) {
 	)
 
 	for _, o := range opts {
-		if err := o(&as); err != nil {
+		if err := o(as); err != nil {
 			return nil, trace.Wrap(err)
 		}
 	}
@@ -722,6 +761,14 @@ func NewServer(cfg *InitConfig, opts ...ServerOption) (*Server, error) {
 	if as.k8sJWKSValidator == nil {
 		as.k8sJWKSValidator = kubetoken.ValidateTokenWithJWKS
 	}
+	if as.k8sOIDCValidator == nil {
+		validator, err := kubetoken.NewKubernetesOIDCTokenValidator()
+		if err != nil {
+			return nil, trace.Wrap(err)
+		}
+
+		as.k8sOIDCValidator = validator
+	}
 
 	if as.gcpIDTokenValidator == nil {
 		as.gcpIDTokenValidator = gcp.NewIDTokenValidator(
@@ -738,7 +785,7 @@ func NewServer(cfg *InitConfig, opts ...ServerOption) (*Server, error) {
 	}
 
 	if as.createBoundKeypairValidator == nil {
-		as.createBoundKeypairValidator = func(subject, clusterName string, publicKey crypto.PublicKey) (boundKeypairValidator, error) {
+		as.createBoundKeypairValidator = func(subject, clusterName string, publicKey crypto.PublicKey) (joinboundkeypair.BoundKeypairValidator, error) {
 			return boundkeypair.NewChallengeValidator(subject, clusterName, publicKey)
 		}
 	}
@@ -746,9 +793,9 @@ func NewServer(cfg *InitConfig, opts ...ServerOption) (*Server, error) {
 	// Add in a login hook for generating state during user login.
 	as.ulsGenerator, err = userloginstate.NewGenerator(userloginstate.GeneratorConfig{
 		Log:         as.logger,
-		AccessLists: &as,
-		Access:      &as,
-		UsageEvents: &as,
+		AccessLists: as,
+		Access:      as,
+		UsageEvents: as,
 		Clock:       cfg.Clock,
 		Emitter:     as.emitter,
 	})
@@ -770,7 +817,7 @@ func NewServer(cfg *InitConfig, opts ...ServerOption) (*Server, error) {
 		as.logger.WarnContext(closeCtx, "Auth server starting without cache (may have negative performance implications)")
 	}
 
-	return &as, nil
+	return as, nil
 }
 
 // Services is a collection of services that are used by the auth server.
@@ -787,7 +834,7 @@ type Services struct {
 	services.DynamicAccessExt
 	services.ClusterConfigurationInternal
 	services.Restrictions
-	services.Apps
+	services.Applications
 	services.Kubernetes
 	services.Databases
 	services.DatabaseServices
@@ -839,18 +886,13 @@ type Services struct {
 	services.VnetConfigService
 	RecordingEncryptionManager
 	events.MultipartHandler
+	services.Summarizer
 }
 
 // GetWebSession returns existing web session described by req.
 // Implements ReadAccessPoint
 func (r *Services) GetWebSession(ctx context.Context, req types.GetWebSessionRequest) (types.WebSession, error) {
 	return r.Identity.WebSessions().Get(ctx, req)
-}
-
-// GetWebToken returns existing web token described by req.
-// Implements ReadAccessPoint
-func (r *Services) GetWebToken(ctx context.Context, req types.GetWebTokenRequest) (types.WebToken, error) {
-	return r.Identity.WebTokens().Get(ctx, req)
 }
 
 // GenerateAWSOIDCToken generates a token to be used to execute an AWS OIDC Integration action.
@@ -921,6 +963,7 @@ var (
 			Help:      "The number of Teleport services that are connected to an auth server.",
 		},
 		[]string{
+			teleport.TagOS,
 			teleport.TagVersion,
 			teleport.TagAutomaticUpdates,
 		},
@@ -1074,6 +1117,13 @@ type Server struct {
 	// method on Services instead.
 	authclient.Cache
 
+	// ScopedAccessCache is a specialized cache that provides read methods for select
+	// scoped access control resources.
+	ScopedAccessCache *scopedaccesscache.Cache
+
+	// scopedAccessBackend is the backend service for scoped access control resources.
+	scopedAccessBackend services.ScopedAccess
+
 	// ReadOnlyCache is a specialized cache that provides read-only shared references
 	// in certain performance-critical paths where deserialization/cloning may be too
 	// expensive at scale.
@@ -1177,6 +1227,9 @@ type Server struct {
 	// by the auth server using a known JWKS. It can be overridden for the
 	// purpose of tests.
 	k8sJWKSValidator k8sJWKSValidator
+	// k8sOIDCValidator allows tokens from Kubernetes to be validated by the
+	// auth server using a known OIDC endpoint. It can be overridden in tests.
+	k8sOIDCValidator *kubetoken.KubernetesOIDCTokenValidator
 
 	// gcpIDTokenValidator allows ID tokens from GCP to be validated by the auth
 	// server. It can be overridden for the purpose of tests.
@@ -1191,7 +1244,7 @@ type Server struct {
 
 	// createBoundKeypairValidator is a helper to create new bound keypair
 	// challenge validators. Used to override the implementation used in tests.
-	createBoundKeypairValidator createBoundKeypairValidator
+	createBoundKeypairValidator joinboundkeypair.CreateBoundKeypairValidator
 
 	// loadAllCAs tells tsh to load the host CAs for all clusters when trying to ssh into a node.
 	loadAllCAs bool
@@ -1249,6 +1302,11 @@ type Server struct {
 
 	// logger is the logger used by the auth server.
 	logger *slog.Logger
+
+	// sessionSummarizerProvider is a provider of the session summarizer service.
+	// It allows for late initialization of the summarizer in the enterprise
+	// plugin. The summarizer itself summarizes session recordings.
+	sessionSummarizerProvider *summarizer.SessionSummarizerProvider
 }
 
 // SetSAMLService registers svc as the SAMLService that provides the SAML
@@ -1273,6 +1331,18 @@ func (a *Server) SetLicense(license *liblicense.License) {
 // SetReleaseService sets the release service
 func (a *Server) SetReleaseService(svc release.Client) {
 	a.releaseService = svc
+}
+
+// ScopedAccess returns an implementation of services.ScopedAccess with all read methods routed
+// to the scoped access cache.
+func (a *Server) ScopedAccess() services.ScopedAccess {
+	return struct {
+		services.ScopedAccessReader
+		services.ScopedAccessWriter
+	}{
+		ScopedAccessReader: a.ScopedAccessCache,
+		ScopedAccessWriter: a.scopedAccessBackend,
+	}
 }
 
 // SetUpgradeWindowStartHourGetter sets the getter used to sync the ClusterMaintenanceConfig resource
@@ -1323,7 +1393,18 @@ func (a *Server) CallLoginHooks(ctx context.Context, user types.User) error {
 	if len(loginHooks) == 0 {
 		return nil
 	}
-
+	// Clone the input user so that hooks never mutate the original object.
+	//
+	// Currently, login hook share state via UserLoginState resources.
+	// The login hook calls GetUserLoginState to read the state, updates it,
+	// and then saves the changes  when a next looking hood loads the state from storage.
+	//
+	// Note: We intentionally do not write access-list–derived roles/traits back
+	// to the user record. Doing so could create inconsistencies with user objects
+	// provisioned by Entra ID / Okta Sync or via SCIM. If we choose to persist
+	// these attributes in the future, we should first define a single source of
+	// truth and a clear reconciliation strategy.
+	user = user.Clone()
 	var errs []error
 	for _, hook := range loginHooks {
 		errs = append(errs, hook(ctx, user))
@@ -1337,6 +1418,12 @@ func (a *Server) ResetLoginHooks() {
 	a.loginHooksMu.Lock()
 	a.loginHooks = nil
 	a.loginHooksMu.Unlock()
+}
+
+// SetSummarizerService sets an implementation of the summarizer service used
+// by this server and its underlying services.
+func (a *Server) SetSummarizerService(s summarizer.SessionSummarizer) {
+	a.sessionSummarizerProvider.SetSummarizer(s)
 }
 
 // CloseContext returns the close context
@@ -1376,6 +1463,12 @@ func (a *Server) SetLockWatcher(lockWatcher *services.LockWatcher) {
 	a.lock.Lock()
 	defer a.lock.Unlock()
 	a.lockWatcher = lockWatcher
+}
+
+// CheckLockInForce returns an AccessDenied error if there is a lock in force
+// matching at least one of the targets.
+func (a *Server) CheckLockInForce(mode constants.LockingMode, targets []types.LockTarget) error {
+	return a.checkLockInForce(mode, targets)
 }
 
 func (a *Server) checkLockInForce(mode constants.LockingMode, targets []types.LockTarget) error {
@@ -2007,6 +2100,7 @@ func (a *Server) updateAgentMetrics() {
 	registeredAgents.Reset()
 	for agent, count := range imp.RegisteredAgentsCount() {
 		registeredAgents.With(prometheus.Labels{
+			teleport.TagOS:               agent.os,
 			teleport.TagVersion:          agent.version,
 			teleport.TagAutomaticUpdates: agent.automaticUpdates,
 		}).Set(float64(count))
@@ -2096,6 +2190,12 @@ func (a *Server) Close() error {
 		}
 	}
 
+	if a.ScopedAccessCache != nil {
+		if err := a.ScopedAccessCache.Close(); err != nil {
+			errs = append(errs, err)
+		}
+	}
+
 	if a.AccessRequestCache != nil {
 		if err := a.AccessRequestCache.Close(); err != nil {
 			errs = append(errs, err)
@@ -2128,6 +2228,13 @@ func (a *Server) SetClock(clock clockwork.Clock) {
 	a.lock.Lock()
 	defer a.lock.Unlock()
 	a.clock = clock
+}
+
+// SetBcryptCost sets bcryptCostOverride, used in tests
+func (a *Server) SetBcryptCost(cost int) {
+	a.lock.Lock()
+	defer a.lock.Unlock()
+	a.bcryptCostOverride = &cost
 }
 
 func (a *Server) SetSCIMService(scim services.SCIM) {
@@ -2330,8 +2437,12 @@ type certRequest struct {
 	// impersonator is a user who generates the certificate,
 	// is set when different from the user in the certificate
 	impersonator string
-	// checker is used to perform RBAC checks.
-	checker services.AccessChecker
+
+	// checker is an access checker that may either be scoped or unscoped. used to generate various
+	// certificate parameters, some of which differ depending on whether the cert being generated
+	// is scoped or not.
+	checker *services.SplitAccessChecker
+
 	// ttl is Duration of the certificate
 	ttl time.Duration
 	// compatibility is compatibility mode
@@ -2545,7 +2656,7 @@ func (a *Server) GenerateOpenSSHCert(ctx context.Context, req *proto.OpenSSHCert
 		user:            req.User,
 		sshPublicKey:    req.PublicKey,
 		compatibility:   constants.CertificateFormatStandard,
-		checker:         checker,
+		checker:         services.NewUnscopedSplitAccessChecker(checker), // TODO(fspmarshall/scopes): add scoping support to OpenSSH certs.
 		ttl:             sessionTTL,
 		traits:          req.User.GetTraits(),
 		routeToCluster:  req.Cluster,
@@ -2561,6 +2672,7 @@ func (a *Server) GenerateOpenSSHCert(ctx context.Context, req *proto.OpenSSHCert
 }
 
 // GenerateUserTestCertsRequest is a request to generate test certificates.
+// TODO(tross): Figure out how to move this into test only code.
 type GenerateUserTestCertsRequest struct {
 	SSHPubKey               []byte
 	TLSPubKey               []byte
@@ -2574,11 +2686,23 @@ type GenerateUserTestCertsRequest struct {
 	TLSAttestationStatement *hardwarekey.AttestationStatement
 	AppName                 string
 	AppSessionID            string
+	DeviceExtensions        DeviceExtensions
+	Renewable               bool
+	Generation              uint64
+	ActiveRequests          []string
+	KubernetesCluster       string
+	Usage                   []string
 }
 
 // GenerateUserTestCerts is used to generate user certificate, used internally for tests
+// TODO(tross): Figure out how to move this into test only code.
 func (a *Server) GenerateUserTestCerts(req GenerateUserTestCertsRequest) ([]byte, []byte, error) {
-	ctx := context.Background()
+	return a.GenerateUserTestCertsWithContext(context.TODO(), req)
+}
+
+// GenerateUserTestCertsWithContext is used to generate user certificate, used internally for tests
+// TODO(tross): Figure out how to move this into test only code.
+func (a *Server) GenerateUserTestCertsWithContext(ctx context.Context, req GenerateUserTestCertsRequest) ([]byte, []byte, error) {
 	userState, err := a.GetUserOrLoginState(ctx, req.Username)
 	if err != nil {
 		return nil, nil, trace.Wrap(err)
@@ -2593,14 +2717,14 @@ func (a *Server) GenerateUserTestCerts(req GenerateUserTestCertsRequest) ([]byte
 		return nil, nil, trace.Wrap(err)
 	}
 
-	certs, err := a.generateUserCert(ctx, certRequest{
+	certReq := certRequest{
 		user:                             userState,
 		ttl:                              req.TTL,
 		compatibility:                    req.Compatibility,
 		sshPublicKey:                     req.SSHPubKey,
 		tlsPublicKey:                     req.TLSPubKey,
 		routeToCluster:                   req.RouteToCluster,
-		checker:                          checker,
+		checker:                          services.NewUnscopedSplitAccessChecker(checker),
 		traits:                           userState.GetTraits(),
 		loginIP:                          req.PinnedIP,
 		pinIP:                            req.PinnedIP != "",
@@ -2609,7 +2733,20 @@ func (a *Server) GenerateUserTestCerts(req GenerateUserTestCertsRequest) ([]byte
 		tlsPublicKeyAttestationStatement: req.TLSAttestationStatement,
 		appName:                          req.AppName,
 		appSessionID:                     req.AppSessionID,
-	})
+		deviceExtensions:                 req.DeviceExtensions,
+		generation:                       req.Generation,
+		renewable:                        req.Renewable,
+		activeRequests:                   req.ActiveRequests,
+		kubernetesCluster:                req.KubernetesCluster,
+		usage:                            req.Usage,
+	}
+
+	if botName, isBot := userState.GetLabel(types.BotLabel); isBot {
+		certReq.botName = botName
+		certReq.botInstanceID = uuid.NewString()
+	}
+
+	certs, err := a.generateUserCert(ctx, certReq)
 	if err != nil {
 		return nil, nil, trace.Wrap(err)
 	}
@@ -2674,7 +2811,7 @@ func (a *Server) GenerateUserAppTestCert(req AppTestCertRequest) ([]byte, error)
 	certs, err := a.generateUserCert(ctx, certRequest{
 		user:         userState,
 		tlsPublicKey: req.PublicKey,
-		checker:      checker,
+		checker:      services.NewUnscopedSplitAccessChecker(checker),
 		ttl:          req.TTL,
 		// Set the login to be a random string. Application certificates are never
 		// used to log into servers but SSH certificate generation code requires a
@@ -2738,7 +2875,7 @@ func (a *Server) GenerateDatabaseTestCert(req DatabaseTestCertRequest) ([]byte, 
 		tlsPublicKey: req.PublicKey,
 		loginIP:      req.PinnedIP,
 		pinIP:        req.PinnedIP != "",
-		checker:      checker,
+		checker:      services.NewUnscopedSplitAccessChecker(checker),
 		ttl:          time.Hour,
 		traits: map[string][]string{
 			constants.TraitLogins: {req.Username},
@@ -2882,7 +3019,7 @@ func (a *Server) AugmentWebSessionCertificates(ctx context.Context, opts *Augmen
 	if err != nil {
 		return trace.Wrap(err)
 	}
-	accessInfo, err := services.AccessInfoFromLocalTLSIdentity(*x509Identity, a)
+	accessInfo, err := services.AccessInfoFromLocalTLSIdentity(*x509Identity)
 	if err != nil {
 		return trace.Wrap(err)
 	}
@@ -3072,7 +3209,7 @@ func (a *Server) augmentUserCertificates(
 		return nil, trace.Wrap(err)
 	}
 	if err := a.verifyLocksForUserCerts(verifyLocksForUserCertsReq{
-		checker:              opts.checker,
+		checker:              services.NewUnscopedSplitAccessChecker(opts.checker), // TODO(fspmarshall/scopes): add scoping support to AugmentUserCertificates.
 		defaultMode:          readOnlyAuthPref.GetLockingMode(),
 		username:             x509Identity.Username,
 		mfaVerified:          x509Identity.MFAVerified,
@@ -3128,7 +3265,7 @@ func (a *Server) augmentUserCertificates(
 	}
 
 	// Issue audit event on success, same as [Server.generateCert].
-	a.emitCertCreateEvent(ctx, newIdentity, notAfter)
+	a.emitCertCreateEvent(ctx, tlsCA, newIdentity, notAfter)
 
 	return &proto.Certs{
 		SSH: newAuthorizedKey,
@@ -3202,8 +3339,17 @@ func generateCert(ctx context.Context, a *Server, req certRequest, caType types.
 		return nil, trace.Wrap(err)
 	}
 
-	if len(req.checker.GetAllowedResourceIDs()) > 0 && modules.GetModules().BuildType() != modules.BuildEnterprise {
-		return nil, fmt.Errorf("resource access requests: %w", ErrRequiresEnterprise)
+	if _, ok := req.checker.Scoped(); ok {
+		// require that the scope feature is enabled for scoped certificate creation
+		if err := scopes.AssertFeatureEnabled(); err != nil {
+			return nil, trace.Wrap(err)
+		}
+	}
+
+	if unscopedChecker, ok := req.checker.Unscoped(); ok {
+		if len(unscopedChecker.GetAllowedResourceIDs()) > 0 && modules.GetModules().BuildType() != modules.BuildEnterprise {
+			return nil, trace.Errorf("resource access requests: %w", ErrRequiresEnterprise)
+		}
 	}
 
 	// Reject the cert request if there is a matching lock in force.
@@ -3230,8 +3376,21 @@ func generateCert(ctx context.Context, a *Server, req certRequest, caType types.
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
-	if certificateFormat == teleport.CertificateFormatUnspecified {
-		certificateFormat = req.checker.CertificateFormat()
+
+	// scoped identities must use the standard certificate format, unscoped identities may have their
+	// certificate format customized by request parameters and/or role settings.
+	if unscopedChecker, ok := req.checker.Unscoped(); ok {
+		if certificateFormat == teleport.CertificateFormatUnspecified {
+			certificateFormat = unscopedChecker.CertificateFormat()
+		}
+	} else {
+		switch certificateFormat {
+		case constants.CertificateFormatStandard:
+		case teleport.CertificateFormatUnspecified:
+			certificateFormat = constants.CertificateFormatStandard
+		default:
+			return nil, trace.BadParameter("certificate format %q is not supported for scoped access", certificateFormat)
+		}
 	}
 
 	var sessionTTL time.Duration
@@ -3249,7 +3408,7 @@ func generateCert(ctx context.Context, a *Server, req certRequest, caType types.
 		// Take whatever was passed in. Pass in 0 to CheckLoginDuration so all
 		// logins are returned for the role set.
 		sessionTTL = req.ttl
-		allowedLogins, err = req.checker.CheckLoginDuration(0)
+		allowedLogins, err = req.checker.Common().CheckLoginDuration(0)
 		if err != nil {
 			return nil, trace.Wrap(err)
 		}
@@ -3257,11 +3416,11 @@ func generateCert(ctx context.Context, a *Server, req certRequest, caType types.
 		// Adjust session TTL to the smaller of two values: the session TTL requested
 		// in tsh (possibly using default_session_ttl) or the session TTL for the
 		// role.
-		sessionTTL = req.checker.AdjustSessionTTL(req.ttl)
+		sessionTTL = req.checker.Common().AdjustSessionTTL(req.ttl)
 		// Return a list of logins that meet the session TTL limit. This means if
 		// the requested session TTL is larger than the max session TTL for a login,
 		// that login will not be included in the list of allowed logins.
-		allowedLogins, err = req.checker.CheckLoginDuration(sessionTTL)
+		allowedLogins, err = req.checker.Common().CheckLoginDuration(sessionTTL)
 		if err != nil {
 			return nil, trace.Wrap(err)
 		}
@@ -3269,7 +3428,7 @@ func generateCert(ctx context.Context, a *Server, req certRequest, caType types.
 	notAfter := a.clock.Now().UTC().Add(sessionTTL)
 
 	attestedKeyPolicy := keys.PrivateKeyPolicyNone
-	requiredKeyPolicy, err := req.checker.PrivateKeyPolicy(readOnlyAuthPref.GetPrivateKeyPolicy())
+	requiredKeyPolicy, err := req.checker.Common().PrivateKeyPolicy(readOnlyAuthPref.GetPrivateKeyPolicy())
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
@@ -3291,7 +3450,7 @@ func generateCert(ctx context.Context, a *Server, req certRequest, caType types.
 				sessionTTL:           sessionTTL,
 				readOnlyAuthPref:     readOnlyAuthPref,
 				userName:             req.user.GetName(),
-				userTraits:           req.checker.Traits(),
+				userTraits:           req.checker.Common().Traits(),
 			})
 			if err != nil {
 				return nil, trace.Wrap(err, "attesting SSH key")
@@ -3309,7 +3468,7 @@ func generateCert(ctx context.Context, a *Server, req certRequest, caType types.
 				sessionTTL:           sessionTTL,
 				readOnlyAuthPref:     readOnlyAuthPref,
 				userName:             req.user.GetName(),
-				userTraits:           req.checker.Traits(),
+				userTraits:           req.checker.Common().Traits(),
 			})
 			if err != nil {
 				return nil, trace.Wrap(err, "attesting TLS key")
@@ -3330,12 +3489,17 @@ func generateCert(ctx context.Context, a *Server, req certRequest, caType types.
 		req.routeToCluster = clusterName
 	}
 	if req.routeToCluster != clusterName {
+		unscopedChecker, ok := req.checker.Unscoped()
+		if !ok {
+			return nil, trace.BadParameter("cannot generate certs for remote cluster %q, remote cluster access is only supported for unscoped certs", req.routeToCluster)
+		}
+
 		// Authorize access to a remote cluster.
 		rc, err := a.GetRemoteCluster(ctx, req.routeToCluster)
 		if err != nil {
 			return nil, trace.Wrap(err)
 		}
-		if err := req.checker.CheckAccessToRemoteCluster(rc); err != nil {
+		if err := unscopedChecker.CheckAccessToRemoteCluster(rc); err != nil {
 			if trace.IsAccessDenied(err) {
 				return nil, trace.NotFound("remote cluster %q not found", req.routeToCluster)
 			}
@@ -3348,7 +3512,7 @@ func generateCert(ctx context.Context, a *Server, req certRequest, caType types.
 	allowedLogins = append(allowedLogins, teleport.SSHSessionJoinPrincipal)
 
 	pinnedIP := ""
-	if caType == types.UserCA && (req.checker.PinSourceIP() || req.pinIP) {
+	if caType == types.UserCA && (req.checker.Common().PinSourceIP() || req.pinIP) {
 		if req.loginIP == "" {
 			return nil, trace.BadParameter("IP pinning is enabled for user %q but there is no client IP information", req.user.GetName())
 		}
@@ -3371,11 +3535,33 @@ func generateCert(ctx context.Context, a *Server, req certRequest, caType types.
 		githubUsername = githubIdentities[0].Username
 	}
 
+	// collect fields which are mutually exclusive to scoped or unscoped certs
+	var (
+		scopePin           *scopesv1.Pin
+		roleNames          []string
+		allowedResourceIDs []types.ResourceID
+	)
+
+	if scopedChecker, ok := req.checker.Scoped(); ok {
+		scopePin = scopedChecker.ScopePin()
+	}
+
+	if unscopedChecker, ok := req.checker.Unscoped(); ok {
+		roleNames = unscopedChecker.RoleNames()
+		allowedResourceIDs = unscopedChecker.GetAllowedResourceIDs()
+	}
+
 	var signedSSHCert []byte
 	if req.sshPublicKey != nil {
 		sshSigner, err := a.keyStore.GetSSHSigner(ctx, ca)
 		if err != nil {
 			return nil, trace.Wrap(err)
+		}
+
+		// certificate extensions are only supported for unscoped ssh certs
+		var certificateExtensions []*types.CertExtension
+		if unscopedChecker, ok := req.checker.Unscoped(); ok {
+			certificateExtensions = unscopedChecker.CertificateExtensions()
 		}
 
 		params := sshca.UserCertificateRequest{
@@ -3387,10 +3573,11 @@ func generateCert(ctx context.Context, a *Server, req certRequest, caType types.
 				Username:                req.user.GetName(),
 				Impersonator:            req.impersonator,
 				Principals:              allowedLogins,
-				Roles:                   req.checker.RoleNames(),
-				PermitPortForwarding:    req.checker.CanPortForward(),
-				PermitAgentForwarding:   req.checker.CanForwardAgents(),
-				PermitX11Forwarding:     req.checker.PermitX11Forwarding(),
+				ScopePin:                scopePin,
+				Roles:                   roleNames,
+				PermitPortForwarding:    req.checker.Common().CanPortForward(),
+				PermitAgentForwarding:   req.checker.Common().CanForwardAgents(),
+				PermitX11Forwarding:     req.checker.Common().PermitX11Forwarding(),
 				RouteToCluster:          req.routeToCluster,
 				Traits:                  req.traits,
 				ActiveRequests:          req.activeRequests,
@@ -3404,8 +3591,8 @@ func generateCert(ctx context.Context, a *Server, req certRequest, caType types.
 				BotName:                 req.botName,
 				BotInstanceID:           req.botInstanceID,
 				JoinToken:               req.joinToken,
-				CertificateExtensions:   req.checker.CertificateExtensions(),
-				AllowedResourceIDs:      req.checker.GetAllowedResourceIDs(),
+				CertificateExtensions:   certificateExtensions,
+				AllowedResourceIDs:      allowedResourceIDs,
 				ConnectionDiagnosticID:  req.connectionDiagnosticID,
 				PrivateKeyPolicy:        attestedKeyPolicy,
 				DeviceID:                req.deviceExtensions.DeviceID,
@@ -3421,12 +3608,6 @@ func generateCert(ctx context.Context, a *Server, req certRequest, caType types.
 		}
 	}
 
-	kubeGroups, kubeUsers, err := req.checker.CheckKubeGroupsAndUsers(sessionTTL, req.overrideRoleTTL)
-	// NotFound errors are acceptable - this user may have no k8s access
-	// granted and that shouldn't prevent us from issuing a TLS cert.
-	if err != nil && !trace.IsNotFound(err) {
-		return nil, trace.Wrap(err)
-	}
 	// Ensure that the Kubernetes cluster name specified in the request exists
 	// when the certificate is intended for a local Kubernetes cluster.
 	// If the certificate is targeting a trusted Teleport cluster, it is the
@@ -3448,34 +3629,52 @@ func generateCert(ctx context.Context, a *Server, req certRequest, caType types.
 		}
 	}
 
-	// See which database names and users this user is allowed to use.
-	dbNames, dbUsers, err := req.checker.CheckDatabaseNamesAndUsers(sessionTTL, req.overrideRoleTTL)
-	if err != nil && !trace.IsNotFound(err) {
-		return nil, trace.Wrap(err)
+	var (
+		kubeGroups, kubeUsers []string
+		dbNames, dbUsers      []string
+		roleARNs              []string
+		azureIdentities       []string
+		gcpAccounts           []string
+	)
+
+	// only unscoped identities currently support kube groups/users.
+	if unscopedChecker, ok := req.checker.Unscoped(); ok {
+		kubeGroups, kubeUsers, err = unscopedChecker.CheckKubeGroupsAndUsers(sessionTTL, req.overrideRoleTTL)
+		// NotFound errors are acceptable - this user may have no k8s access
+		// granted and that shouldn't prevent us from issuing a TLS cert.
+		if err != nil && !trace.IsNotFound(err) {
+			return nil, trace.Wrap(err)
+		}
+
+		// See which database names and users this user is allowed to use.
+		dbNames, dbUsers, err = unscopedChecker.CheckDatabaseNamesAndUsers(sessionTTL, req.overrideRoleTTL)
+		if err != nil && !trace.IsNotFound(err) {
+			return nil, trace.Wrap(err)
+		}
+
+		// See which AWS role ARNs this user is allowed to assume.
+		roleARNs, err = unscopedChecker.CheckAWSRoleARNs(sessionTTL, req.overrideRoleTTL)
+		if err != nil && !trace.IsNotFound(err) {
+			return nil, trace.Wrap(err)
+		}
+
+		// See which Azure identities this user is allowed to assume.
+		azureIdentities, err = unscopedChecker.CheckAzureIdentities(sessionTTL, req.overrideRoleTTL)
+		if err != nil && !trace.IsNotFound(err) {
+			return nil, trace.Wrap(err)
+		}
+
+		// Enumerate allowed GCP service accounts.
+		gcpAccounts, err = unscopedChecker.CheckGCPServiceAccounts(sessionTTL, req.overrideRoleTTL)
+		if err != nil && !trace.IsNotFound(err) {
+			return nil, trace.Wrap(err)
+		}
 	}
 
-	// See which AWS role ARNs this user is allowed to assume.
-	roleARNs, err := req.checker.CheckAWSRoleARNs(sessionTTL, req.overrideRoleTTL)
-	if err != nil && !trace.IsNotFound(err) {
-		return nil, trace.Wrap(err)
-	}
-
-	// See which Azure identities this user is allowed to assume.
-	azureIdentities, err := req.checker.CheckAzureIdentities(sessionTTL, req.overrideRoleTTL)
-	if err != nil && !trace.IsNotFound(err) {
-		return nil, trace.Wrap(err)
-	}
-
-	// Enumerate allowed GCP service accounts.
-	gcpAccounts, err := req.checker.CheckGCPServiceAccounts(sessionTTL, req.overrideRoleTTL)
-	if err != nil && !trace.IsNotFound(err) {
-		return nil, trace.Wrap(err)
-	}
-
-	// Generate AWS credential process credentials if the user is trying to access an App with an AWS Roles Anywhere Integration.
-	awsCredentialProcessCredentials, err := generateAWSConfigCredentialProcessCredentials(ctx, a, req, notAfter)
+	// Generate AWS client side credentials if the user is trying to access an AWS App with an AWS Roles Anywhere Integration.
+	awsCredentialProcessCredentials, err := generateAWSClientSideCredentials(ctx, a, req, notAfter)
 	switch {
-	case errors.Is(err, errNotIntegrationApp):
+	case errors.Is(err, errAppWithoutAWSClientSideCredentials):
 	case err != nil:
 		return nil, trace.Wrap(err)
 	}
@@ -3483,7 +3682,8 @@ func generateCert(ctx context.Context, a *Server, req certRequest, caType types.
 	identity := tlsca.Identity{
 		Username:          req.user.GetName(),
 		Impersonator:      req.impersonator,
-		Groups:            req.checker.RoleNames(),
+		ScopePin:          scopePin,
+		Groups:            roleNames,
 		Principals:        allowedLogins,
 		Usage:             req.usage,
 		RouteToCluster:    req.routeToCluster,
@@ -3503,7 +3703,8 @@ func generateCert(ctx context.Context, a *Server, req certRequest, caType types.
 			AzureIdentity:                   req.azureIdentity,
 			GCPServiceAccount:               req.gcpServiceAccount,
 		},
-		TeleportCluster: clusterName,
+		TeleportCluster:   clusterName,
+		OriginClusterName: clusterName,
 		RouteToDatabase: tlsca.RouteToDatabase{
 			ServiceName: req.dbService,
 			Protocol:    req.dbProtocol,
@@ -3527,7 +3728,7 @@ func generateCert(ctx context.Context, a *Server, req certRequest, caType types.
 		BotName:                 req.botName,
 		BotInstanceID:           req.botInstanceID,
 		JoinToken:               req.joinToken,
-		AllowedResourceIDs:      req.checker.GetAllowedResourceIDs(),
+		AllowedResourceIDs:      allowedResourceIDs,
 		PrivateKeyPolicy:        attestedKeyPolicy,
 		ConnectionDiagnosticID:  req.connectionDiagnosticID,
 		DeviceExtensions: tlsca.DeviceExtensions{
@@ -3540,6 +3741,7 @@ func generateCert(ctx context.Context, a *Server, req certRequest, caType types.
 	}
 
 	var signedTLSCert []byte
+	var tlsIssuer *tlsca.CertAuthority
 	if req.tlsPublicKey != nil {
 		tlsCryptoPubKey, err := keys.ParsePublicKey(req.tlsPublicKey)
 		if err != nil {
@@ -3567,9 +3769,10 @@ func generateCert(ctx context.Context, a *Server, req certRequest, caType types.
 		if err != nil {
 			return nil, trace.Wrap(err)
 		}
+		tlsIssuer = tlsCA
 	}
 
-	a.emitCertCreateEvent(ctx, &identity, notAfter)
+	a.emitCertCreateEvent(ctx, tlsIssuer, &identity, notAfter)
 
 	// create certs struct to return to user
 	certs := &proto.Certs{
@@ -3676,8 +3879,8 @@ func (a *Server) attestHardwareKey(ctx context.Context, params *attestHardwareKe
 }
 
 type verifyLocksForUserCertsReq struct {
-	checker services.AccessChecker
-
+	// checker is a split access checker which may be scoped or unscoped.
+	checker *services.SplitAccessChecker
 	// defaultMode is the default locking mode, as recorded in the cluster
 	// Auth Preferences.
 	defaultMode constants.LockingMode
@@ -3702,17 +3905,22 @@ type verifyLocksForUserCertsReq struct {
 // verifyLocksForUserCerts verifies if any locks are in place before issuing new
 // user certificates.
 func (a *Server) verifyLocksForUserCerts(req verifyLocksForUserCertsReq) error {
-	checker := req.checker
-	lockingMode := checker.LockingMode(req.defaultMode)
+	lockingMode := req.checker.Common().LockingMode(req.defaultMode)
 
 	lockTargets := []types.LockTarget{
 		{User: req.username},
 		{MFADevice: req.mfaVerified},
 		{Device: req.deviceID},
 	}
-	lockTargets = append(lockTargets,
-		services.RolesToLockTargets(checker.RoleNames())...,
-	)
+
+	if unscopedChecker, ok := req.checker.Unscoped(); ok {
+		lockTargets = append(lockTargets,
+			services.RolesToLockTargets(unscopedChecker.RoleNames())...,
+		)
+	}
+
+	// TODO(fspmarshall/scopes): implement scoped role locking.
+
 	lockTargets = append(lockTargets,
 		services.AccessRequestsToLockTargets(req.activeAccessRequests)...,
 	)
@@ -3754,9 +3962,17 @@ func (a *Server) getSigningCAs(ctx context.Context, domainName string, caType ty
 	return tlsCA, sshSigner, ca, nil
 }
 
-func (a *Server) emitCertCreateEvent(ctx context.Context, identity *tlsca.Identity, notAfter time.Time) {
+func (a *Server) emitCertCreateEvent(ctx context.Context, issuer *tlsca.CertAuthority, identity *tlsca.Identity, notAfter time.Time) {
 	eventIdentity := identity.GetEventIdentity()
 	eventIdentity.Expires = notAfter
+	var certAuthority *apievents.CertificateAuthority
+	if issuer != nil {
+		certAuthority = &apievents.CertificateAuthority{
+			Type:         string(types.UserCA),
+			Domain:       issuer.Cert.Issuer.CommonName,
+			SubjectKeyID: base32.HexEncoding.EncodeToString(issuer.Cert.SubjectKeyId),
+		}
+	}
 	if err := a.emitter.EmitAuditEvent(a.closeCtx, &apievents.CertificateCreate{
 		Metadata: apievents.Metadata{
 			Type: events.CertificateCreateEvent,
@@ -3769,6 +3985,7 @@ func (a *Server) emitCertCreateEvent(ctx context.Context, identity *tlsca.Identi
 			// fetched. Need to propagate user-agent from HTTP calls.
 			UserAgent: trimUserAgent(metadata.UserAgentFromContext(ctx)),
 		},
+		CertificateAuthority: certAuthority,
 	}); err != nil {
 		a.logger.WarnContext(ctx, "Failed to emit certificate create event", "error", err)
 	}
@@ -4561,7 +4778,7 @@ func (a *Server) ExtendWebSession(ctx context.Context, req authclient.WebSession
 		return nil, trace.NotFound("web session has expired")
 	}
 
-	accessInfo, err := services.AccessInfoFromLocalTLSIdentity(identity, a)
+	accessInfo, err := services.AccessInfoFromLocalTLSIdentity(identity)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
@@ -5159,7 +5376,7 @@ const TokenExpiredOrNotFound = "token expired or not found"
 // a list of roles this token allows its owner to assume and token labels, or an error if the token
 // cannot be found.
 func (a *Server) ValidateToken(ctx context.Context, token string) (types.ProvisionToken, error) {
-	tkns, err := a.GetStaticTokens()
+	tkns, err := a.GetStaticTokens(ctx)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
@@ -5214,7 +5431,7 @@ func (a *Server) checkTokenTTL(tok types.ProvisionToken) bool {
 }
 
 func (a *Server) DeleteToken(ctx context.Context, token string) (err error) {
-	tkns, err := a.GetStaticTokens()
+	tkns, err := a.GetStaticTokens(ctx)
 	if err != nil {
 		return trace.Wrap(err)
 	}
@@ -5238,14 +5455,25 @@ func (a *Server) DeleteToken(ctx context.Context, token string) (err error) {
 
 // GetTokens returns all tokens (machine provisioning ones and user tokens). Machine
 // tokens usually have "node roles", like auth,proxy,node and user invitation tokens have 'signup' role
-func (a *Server) GetTokens(ctx context.Context, opts ...services.MarshalOption) (tokens []types.ProvisionToken, err error) {
+// Deprecated: Use [ListProvisionTokens], [ListUserTokens], and [GetStaticTokens] instead.
+// TODO(hugoShaka): DELETE IN 21.0.0
+func (a *Server) GetTokens(ctx context.Context, opts ...services.MarshalOption) ([]types.ProvisionToken, error) {
 	// get node tokens:
-	tokens, err = a.Services.GetTokens(ctx)
+	tokens, err := iterstream.Collect(
+		clientutils.Resources(
+			ctx,
+			// ListProvisionTokens take too many arguments for [clientutils.Resources]
+			// so we wrap it to get the usual paginated signature.
+			func(ctx context.Context, pageSize int, pageKey string) ([]types.ProvisionToken, string, error) {
+				return a.Services.ListProvisionTokens(ctx, pageSize, pageKey, nil, "")
+			},
+		),
+	)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
 	// get static tokens:
-	tkns, err := a.GetStaticTokens()
+	tkns, err := a.GetStaticTokens(ctx)
 	if err != nil && !trace.IsNotFound(err) {
 		return nil, trace.Wrap(err)
 	}
@@ -5253,9 +5481,9 @@ func (a *Server) GetTokens(ctx context.Context, opts ...services.MarshalOption) 
 		tokens = append(tokens, tkns.GetStaticTokens()...)
 	}
 	// get user tokens:
-	userTokens, err := a.GetUserTokens(ctx)
+	userTokens, err := iterstream.Collect(clientutils.Resources(ctx, a.Services.ListUserTokens))
 	if err != nil {
-		return nil, trace.Wrap(err)
+		return nil, trace.Wrap(err, "retrieving user tokens")
 	}
 	// convert user tokens to machine tokens:
 	for _, t := range userTokens {
@@ -5383,10 +5611,37 @@ func (a *Server) CreateAccessRequestV2(ctx context.Context, req types.AccessRequ
 		return nil, trace.Wrap(err)
 	}
 
+	// Fetch all Access Lists from the Cache, for use in generating Request promotions and validating long-term grouping
+	allAccessLists, err := a.Cache.GetAccessLists(ctx)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	var longTermResourceGrouping *types.LongTermResourceGrouping
+
+	if req.GetRequestKind().IsLongTerm() {
+		longTermResourceGrouping, err = a.generateLongTermResourceGrouping(ctx, req, allAccessLists)
+		if err != nil {
+			return nil, trace.Wrap(err)
+		}
+		if longTermResourceGrouping == nil {
+			return nil, trace.Errorf("Failed to find optimal resource grouping for long-term access")
+		}
+		if !longTermResourceGrouping.CanProceed && !req.GetDryRun() {
+			return nil, trace.BadParameter("%s", longTermResourceGrouping.ValidationMessage)
+		}
+	}
+
 	if req.GetDryRun() {
 		// NOTE: Some dry-run options are set in [services.ValidateAccessRequestForUser].
-		_, promotions := a.generateAccessRequestPromotions(ctx, req)
+		_, promotions := a.generateAccessRequestPromotions(ctx, req, allAccessLists)
+		// TODO(kiosion): if long-term, skip promotion generation, and instead, use info from LongTermResourceGrouping to add additional reviewers.
 		updateAccessRequestWithAdditionalReviewers(ctx, req, a.AccessLists, promotions)
+
+		if req.GetRequestKind().IsLongTerm() {
+			req.SetLongTermResourceGrouping(longTermResourceGrouping)
+		}
+
 		// Return before creating the request if this is a dry run.
 		return req, nil
 	}
@@ -5402,6 +5657,12 @@ func (a *Server) CreateAccessRequestV2(ctx context.Context, req types.AccessRequ
 
 	if _, err := a.Services.CreateAccessRequestV2(ctx, req); err != nil {
 		return nil, trace.Wrap(err)
+	}
+
+	// We want the long-term grouping info present in the returned request,
+	// but don't want it persisted via setting before saving the request.
+	if req.GetRequestKind().IsLongTerm() {
+		req.SetLongTermResourceGrouping(longTermResourceGrouping)
 	}
 
 	var annotations *apievents.Struct
@@ -5438,7 +5699,7 @@ func (a *Server) CreateAccessRequestV2(ctx context.Context, req types.AccessRequ
 		a.logger.WarnContext(ctx, "Failed to emit access request create event", "error", err)
 	}
 
-	var resources = []string{}
+	resources := []string{}
 	if len(req.GetRoles()) != 0 {
 		resources = append(resources, types.KindRole)
 	}
@@ -5497,7 +5758,7 @@ func (a *Server) CreateAccessRequestV2(ctx context.Context, req types.AccessRequ
 	}
 
 	// calculate the promotions
-	reqCopy, promotions := a.generateAccessRequestPromotions(ctx, req)
+	reqCopy, promotions := a.generateAccessRequestPromotions(ctx, req, allAccessLists)
 	if promotions != nil {
 		// Create the promotion entry even if the allowed promotion is empty. Otherwise, we won't
 		// be able to distinguish between an allowed empty set and generation failure.
@@ -5515,7 +5776,7 @@ func (a *Server) CreateAccessRequestV2(ctx context.Context, req types.AccessRequ
 // appendImplicitlyRequiredResources examines the set of requested resources and adds
 // any extra resources that are implicitly required by the request.
 func (a *Server) appendImplicitlyRequiredResources(ctx context.Context, resources []types.ResourceID) ([]types.ResourceID, error) {
-	addedApps := utils.NewSet[string]()
+	addedApps := set.New[string]()
 	var userGroups []types.ResourceID
 	var accountAssignments []types.ResourceID
 
@@ -5549,13 +5810,12 @@ func (a *Server) appendImplicitlyRequiredResources(ctx context.Context, resource
 		}
 	}
 
-	icAccounts := utils.NewSet[string]()
+	icAccounts := set.New[string]()
 	for _, resource := range accountAssignments {
 		// The UI needs access to the account associated with an Account Assignment
 		// in order to display the enclosing Account, otherwise the user will not
 		// be able to see their assigned permission sets.
-		assignmentID := services.IdentityCenterAccountAssignmentID(resource.Name)
-		asmt, err := a.Services.IdentityCenter.GetAccountAssignment(ctx, assignmentID)
+		asmt, err := a.GetIdentityCenterAccountAssignment(ctx, resource.Name)
 		if err != nil {
 			return nil, trace.Wrap(err, "fetching identity center account assignment")
 		}
@@ -5590,11 +5850,32 @@ func (a *Server) checkResourcesRequestable(ctx context.Context, resourceIDs []ty
 	return nil
 }
 
+// cacheWithFetchedAccessLists is a wrapper around authclient.Cache to provide pre-fetched Access Lists
+// for use in both generating long-term resource groupings, and generating access request promotions.
+// This avoids the need to fetch Access Lists from the backend multiple times per-CreateAccessRequest call.
+type cacheWithFetchedAccessLists struct {
+	authclient.Cache
+	fetchedACLs []*accesslist.AccessList
+}
+
+func (c *cacheWithFetchedAccessLists) GetAccessLists(context.Context) ([]*accesslist.AccessList, error) {
+	return c.fetchedACLs, nil
+}
+
+func (c *cacheWithFetchedAccessLists) ListAccessLists(context.Context, int, string) ([]*accesslist.AccessList, string, error) {
+	return c.fetchedACLs, "", nil
+}
+
+// generateLongTermResourceGrouping will validate and group resources based on coverage by access lists.
+func (a *Server) generateLongTermResourceGrouping(ctx context.Context, req types.AccessRequest, acls []*accesslist.AccessList) (*types.LongTermResourceGrouping, error) {
+	return modules.GetModules().GenerateLongTermResourceGrouping(ctx, &cacheWithFetchedAccessLists{a.Cache, acls}, req)
+}
+
 // generateAccessRequestPromotions will return potential access list promotions for an access request. On error, this function will log
 // the error and return whatever it has. The caller is expected to deal with the possibility of a nil promotions object.
-func (a *Server) generateAccessRequestPromotions(ctx context.Context, req types.AccessRequest) (types.AccessRequest, *types.AccessRequestAllowedPromotions) {
+func (a *Server) generateAccessRequestPromotions(ctx context.Context, req types.AccessRequest, acls []*accesslist.AccessList) (types.AccessRequest, *types.AccessRequestAllowedPromotions) {
 	reqCopy := req.Copy()
-	promotions, err := modules.GetModules().GenerateAccessRequestPromotions(ctx, a.Cache, reqCopy)
+	promotions, err := modules.GetModules().GenerateAccessRequestPromotions(ctx, &cacheWithFetchedAccessLists{a.Cache, acls}, reqCopy)
 	if err != nil {
 		// Do not fail the request if the promotions failed to generate.
 		// The request promotion will be blocked, but the request can still be approved.
@@ -5611,7 +5892,7 @@ func updateAccessRequestWithAdditionalReviewers(ctx context.Context, req types.A
 	}
 
 	// For promotions, add in access list owners as additional suggested reviewers
-	additionalReviewers := map[string]struct{}{}
+	additionalReviewers := set.New[string]()
 
 	// Iterate through the promotions, adding the owners of the corresponding access lists as reviewers.
 	for _, promotion := range promotions.Promotions {
@@ -5622,13 +5903,13 @@ func updateAccessRequestWithAdditionalReviewers(ctx context.Context, req types.A
 		}
 
 		for _, owner := range allOwners {
-			additionalReviewers[owner.Name] = struct{}{}
+			additionalReviewers.Add(owner.Name)
 		}
 	}
 
 	// Only modify the original request if additional reviewers were found.
-	if len(additionalReviewers) > 0 {
-		req.SetSuggestedReviewers(append(req.GetSuggestedReviewers(), slices.Collect(maps.Keys(additionalReviewers))...))
+	if additionalReviewers.Len() > 0 {
+		req.SetSuggestedReviewers(append(req.GetSuggestedReviewers(), additionalReviewers.Elements()...))
 	}
 }
 
@@ -5784,7 +6065,7 @@ func (a *Server) submitAccessReview(
 		a.logger.WarnContext(ctx, "Failed to emit access request update event", "error", err)
 	}
 
-	var resources = []string{}
+	resources := []string{}
 	if len(req.GetRoles()) != 0 {
 		resources = append(resources, types.KindRole)
 	}
@@ -6536,11 +6817,10 @@ func (a *Server) CreateAccessListReminderNotifications(ctx context.Context) {
 			}
 		}
 
-		// Create a map of identifiers for quick lookup
-		identifiersMap := make(map[string]struct{})
+		accessListIDs := set.New[string]()
 		for _, id := range identifiers {
 			// id.Spec.UniqueIdentifier is the access list ID
-			identifiersMap[id.Spec.UniqueIdentifier] = struct{}{}
+			accessListIDs.Add(id.Spec.UniqueIdentifier)
 		}
 
 		// owners is the combined list of owners for relevant access lists we are creating the notification for.
@@ -6557,7 +6837,7 @@ func (a *Server) CreateAccessListReminderNotifications(ctx context.Context) {
 				return
 			}
 
-			if _, exists := identifiersMap[accessList.GetName()]; !exists {
+			if !accessListIDs.Contains(accessList.GetName()) {
 				needsNotification = true
 				// Create a unique identifier for this access list so that we know it has been accounted for.
 				// Note that if the auth server crashes between creating this identifier and creating the notification,
@@ -6653,6 +6933,9 @@ func (a *Server) createAccessListReminderNotification(ctx context.Context, owner
 }
 
 // GenerateCertAuthorityCRL generates an empty CRL for the local CA of a given type.
+//
+// WARNING: This is not safe for use in clusters using HSMs or KMS for private key material.
+// Instead, you should prefer using the CRLs that are already present in the certificate_authority resource.
 func (a *Server) GenerateCertAuthorityCRL(ctx context.Context, caType types.CertAuthType) ([]byte, error) {
 	// Generate a CRL for the current cluster CA.
 	clusterName, err := a.GetClusterName(ctx)
@@ -6667,10 +6950,8 @@ func (a *Server) GenerateCertAuthorityCRL(ctx context.Context, caType types.Cert
 		return nil, trace.Wrap(err)
 	}
 
-	// TODO(awly): this will only create a CRL for an active signer.
-	// If there are multiple signers (multiple HSMs), we won't have the full CRL coverage.
-	// Generate a CRL per signer and return all of them separately.
-
+	// Note: this will only create a CRL for a single active signer.
+	// If there are multiple signers (HSMs), we won't have the full CRL coverage.
 	cert, signer, err := a.keyStore.GetTLSCertAndSigner(ctx, ca)
 	if trace.IsNotFound(err) {
 		// If there is no local TLS signer found in the host CA ActiveKeys, this
@@ -6687,13 +6968,8 @@ func (a *Server) GenerateCertAuthorityCRL(ctx context.Context, caType types.Cert
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
-	// Empty CRL valid for 1yr.
-	template := &x509.RevocationList{
-		Number:     big.NewInt(1),
-		ThisUpdate: time.Now().Add(-1 * time.Minute), // 1 min in the past to account for clock skew.
-		NextUpdate: time.Now().Add(365 * 24 * time.Hour),
-	}
-	crl, err := x509.CreateRevocationList(rand.Reader, template, tlsAuthority.Cert, tlsAuthority.Signer)
+
+	crl, err := keystore.GenerateCRL(tlsAuthority.Cert, tlsAuthority.Signer)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}

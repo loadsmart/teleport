@@ -19,6 +19,7 @@
 package multiplexer
 
 import (
+	"bufio"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
@@ -53,10 +54,11 @@ import (
 	"github.com/gravitational/teleport/lib/tlsca"
 	"github.com/gravitational/teleport/lib/utils"
 	"github.com/gravitational/teleport/lib/utils/cert"
+	"github.com/gravitational/teleport/lib/utils/log/logtest"
 )
 
 func TestMain(m *testing.M) {
-	utils.InitLoggerForTests()
+	logtest.InitLogger(testing.Verbose)
 	os.Exit(m.Run())
 }
 
@@ -232,8 +234,8 @@ func TestMux(t *testing.T) {
 				tlsConn := tls.Client(conn, clientConfig(backend1))
 				defer tlsConn.Close()
 
-				// make sure the TLS call succeeded and we got remote address correctly
-				out, err := utils.RoundtripWithConn(tlsConn)
+				// Make an HTTP GET request over the upgraded connection, ensuring that we got the remote address correctly.
+				out, err := httpGet(tlsConn, backend1.URL)
 				require.NoError(t, err)
 				if tt.expectedAddress != "" {
 					require.Equal(t, tt.expectedAddress, out)
@@ -292,7 +294,7 @@ func TestMux(t *testing.T) {
 		defer tlsConn.Close()
 
 		// make sure the TLS call failed
-		_, err = utils.RoundtripWithConn(tlsConn)
+		_, err = httpGet(tlsConn, backend1.URL)
 		require.Error(t, err)
 	})
 
@@ -335,7 +337,7 @@ func TestMux(t *testing.T) {
 		defer tlsConn.Close()
 
 		// make sure the TLS call failed
-		_, err = utils.RoundtripWithConn(tlsConn)
+		_, err = httpGet(tlsConn, backend1.URL)
 		require.Error(t, err)
 	})
 
@@ -381,7 +383,7 @@ func TestMux(t *testing.T) {
 		tlsConn := tls.Client(conn, clientConfig(backend1))
 		defer tlsConn.Close()
 
-		res, err := utils.RoundtripWithConn(tlsConn)
+		res, err := httpGet(tlsConn, backend1.URL)
 		require.NoError(t, err)
 
 		// Make sure that server saw our connection with source port set to 0
@@ -428,7 +430,7 @@ func TestMux(t *testing.T) {
 		defer tlsConn.Close()
 
 		// roundtrip should fail on the timeout
-		_, err = utils.RoundtripWithConn(tlsConn)
+		_, err = httpGet(tlsConn, backend1.URL)
 		require.Error(t, err)
 	})
 
@@ -868,9 +870,9 @@ func TestMux(t *testing.T) {
 			_, err = conn.Write(signedHeader)
 			require.NoError(t, err)
 
-			clt := tls.Client(conn, clientConfig(backend4))
+			tlsConn := tls.Client(conn, clientConfig(backend4))
 
-			out, err := utils.RoundtripWithConn(clt)
+			out, err := httpGet(tlsConn, backend4.URL)
 			require.NoError(t, err)
 			require.Equal(t, addr1.String(), out)
 		})
@@ -896,9 +898,8 @@ func TestMux(t *testing.T) {
 			_, err = conn.Write(signedHeader)
 			require.NoError(t, err)
 
-			clt := tls.Client(conn, clientConfig(backend6))
-
-			out, err := utils.RoundtripWithConn(clt)
+			tlsConn := tls.Client(conn, clientConfig(backend6))
+			out, err := httpGet(tlsConn, backend6.URL)
 			require.NoError(t, err)
 			require.Equal(t, addrV6.String(), out)
 		})
@@ -921,9 +922,8 @@ func TestMux(t *testing.T) {
 			_, err = conn.Write(signedHeader)
 			require.NoError(t, err)
 
-			clt := tls.Client(conn, clientConfig(backend4))
-
-			out, err := utils.RoundtripWithConn(clt)
+			tlsConn := tls.Client(conn, clientConfig(backend4))
+			out, err := httpGet(tlsConn, backend4.URL)
 			require.NoError(t, err)
 
 			// returned address should be marked with port 0 to prevent IP pinning
@@ -980,9 +980,8 @@ func TestMux(t *testing.T) {
 			_, err = conn.Write(signedHeader)
 			require.NoError(t, err)
 
-			clt := tls.Client(conn, clientConfig(backend4))
-
-			_, err = utils.RoundtripWithConn(clt)
+			tlsConn := tls.Client(conn, clientConfig(backend4))
+			_, err = httpGet(tlsConn, backend4.URL)
 			require.Error(t, err)
 		})
 		t.Run("two signed PROXY headers, one signed for wrong cluster", func(t *testing.T) {
@@ -1012,9 +1011,8 @@ func TestMux(t *testing.T) {
 			_, err = conn.Write(signedHeader2)
 			require.NoError(t, err)
 
-			clt := tls.Client(conn, clientConfig(backend4))
-
-			_, err = utils.RoundtripWithConn(clt)
+			tlsConn := tls.Client(conn, clientConfig(backend4))
+			_, err = httpGet(tlsConn, backend4.URL)
 			require.Error(t, err)
 		})
 		t.Run("first unsigned then signed PROXY headers", func(t *testing.T) {
@@ -1045,9 +1043,8 @@ func TestMux(t *testing.T) {
 			_, err = conn.Write(signedHeader)
 			require.NoError(t, err)
 
-			clt := tls.Client(conn, clientConfig(backend4))
-
-			out, err := utils.RoundtripWithConn(clt)
+			tlsConn := tls.Client(conn, clientConfig(backend4))
+			out, err := httpGet(tlsConn, backend4.URL)
 			require.NoError(t, err)
 			require.Equal(t, addr1.String(), out)
 		})
@@ -1079,9 +1076,8 @@ func TestMux(t *testing.T) {
 			_, err = conn.Write(b)
 			require.NoError(t, err)
 
-			clt := tls.Client(conn, clientConfig(backend4))
-
-			_, err = utils.RoundtripWithConn(clt)
+			tlsConn := tls.Client(conn, clientConfig(backend4))
+			_, err = httpGet(tlsConn, backend4.URL)
 			require.Error(t, err)
 		})
 		t.Run("two unsigned PROXY headers, gets an error", func(t *testing.T) {
@@ -1103,9 +1099,8 @@ func TestMux(t *testing.T) {
 			_, err = conn.Write(b)
 			require.NoError(t, err)
 
-			clt := tls.Client(conn, clientConfig(backend4))
-
-			_, err = utils.RoundtripWithConn(clt)
+			tlsConn := tls.Client(conn, clientConfig(backend4))
+			_, err = httpGet(tlsConn, backend4.URL)
 			require.Error(t, err)
 		})
 		t.Run("proxy line with non-teleport TLV", func(t *testing.T) {
@@ -1132,9 +1127,8 @@ func TestMux(t *testing.T) {
 			_, err = conn.Write(header)
 			require.NoError(t, err)
 
-			clt := tls.Client(conn, clientConfig(backend4))
-
-			out, err := utils.RoundtripWithConn(clt)
+			tlsConn := tls.Client(conn, clientConfig(backend4))
+			out, err := httpGet(tlsConn, backend4.URL)
 			require.NoError(t, err)
 			require.Equal(t, addr1.IP.String()+":0", out)
 		})
@@ -1166,9 +1160,8 @@ func TestMux(t *testing.T) {
 			_, err = conn.Write(signedHeader)
 			require.NoError(t, err)
 
-			clt := tls.Client(conn, clientConfig(backend))
-
-			_, err = utils.RoundtripWithConn(clt)
+			tlsConn := tls.Client(conn, clientConfig(backend))
+			_, err = httpGet(tlsConn, backend.URL)
 			require.Error(t, err)
 		})
 	})
@@ -1391,7 +1384,7 @@ func BenchmarkMux_ProxyV2Signature(b *testing.B) {
 			_, err = conn.Write(signedHeader)
 			require.NoError(b, err)
 
-			out, err := utils.RoundtripWithConn(conn)
+			out, err := httpGet(conn, backend4.URL)
 			require.NoError(b, err)
 			require.Equal(b, sAddr.String(), out)
 		}
@@ -1535,4 +1528,32 @@ func (m *muxServer) startServing(muxListener net.Listener, cluster string) (*Mux
 	}
 
 	return mux, backend, nil
+}
+
+// httpGet makes an HTTP GET request over the
+// provided conn, returning the response body.
+func httpGet(conn net.Conn, url string) (string, error) {
+	req, err := http.NewRequest(http.MethodGet, url, nil)
+	if err != nil {
+		return "", err
+	}
+
+	if err := req.Write(conn); err != nil {
+		return "", err
+	}
+
+	reader := bufio.NewReader(conn)
+	resp, err := http.ReadResponse(reader, req)
+	if err != nil {
+		return "", err
+	}
+
+	defer resp.Body.Close()
+
+	out, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", err
+	}
+
+	return string(out), nil
 }

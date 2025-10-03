@@ -20,10 +20,12 @@ package common
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"maps"
 	"net"
 	"net/url"
@@ -64,7 +66,6 @@ import (
 	"github.com/gravitational/teleport/api/metadata"
 	"github.com/gravitational/teleport/api/profile"
 	"github.com/gravitational/teleport/api/types"
-	"github.com/gravitational/teleport/api/types/accesslist"
 	apievents "github.com/gravitational/teleport/api/types/events"
 	"github.com/gravitational/teleport/api/types/wrappers"
 	apiutils "github.com/gravitational/teleport/api/utils"
@@ -89,6 +90,7 @@ import (
 	"github.com/gravitational/teleport/lib/kube/kubeconfig"
 	"github.com/gravitational/teleport/lib/modules"
 	"github.com/gravitational/teleport/lib/observability/tracing"
+	"github.com/gravitational/teleport/lib/scopes"
 	"github.com/gravitational/teleport/lib/services"
 	"github.com/gravitational/teleport/lib/session"
 	"github.com/gravitational/teleport/lib/shell"
@@ -143,8 +145,14 @@ var accessRequestModes = []string{
 	accessRequestModeRole,
 }
 
+// ClientInitFunc defines a function that initiates a connection to
+// the Teleport cluster using the CLI configuration.
+type ClientInitFunc func(cf *CLIConf) (*client.TeleportClient, error)
+
 // CLIConf stores command line arguments and flags:
 type CLIConf struct {
+	// Scope constrains the current operation to a specific target scope
+	Scope string
 	// UserHost contains "[login]@hostname" argument to SSH command
 	UserHost string
 	// Commands to execute on a remote host
@@ -189,6 +197,10 @@ type CLIConf struct {
 	ExplicitUsername bool
 	// Proxy keeps the hostname:port of the Teleport proxy to use
 	Proxy string
+	// Relay is the address of the relay to use, "none" to explicitly disable
+	// the use of a relay, or "default" to use the cluster-provided address even
+	// if a different address was specified at login time.
+	Relay string
 	// TTL defines how long a session must be active (in minutes)
 	MinsToLive int32
 	// SSH Port on a remote SSH host
@@ -440,6 +452,10 @@ type CLIConf struct {
 	// GlobalTshConfigPath is a path to global TSH config. Can be overridden with TELEPORT_GLOBAL_TSH_CONFIG.
 	GlobalTshConfigPath string
 
+	// InsecureListenAnywhere, when set, allows local proxy listener to use any address other than loopback addresses (127/8).
+	InsecureListenAnywhere bool
+	// LocalProxyAddr is an address used by local proxy listener.
+	LocalProxyAddr string
 	// LocalProxyPort is a port used by local proxy listener.
 	LocalProxyPort string
 	// LocalProxyPortMapping is a listening port and an optional target port used by local proxy
@@ -500,7 +516,10 @@ type CLIConf struct {
 	TraceExporter string
 
 	// TracingProvider is the provider to use to create tracers, from which spans can be created.
-	TracingProvider oteltrace.TracerProvider
+	TracingProvider *tracing.Provider
+	// waitingForTracingClient will be set to true if the tracing provider is
+	// waiting for a *tracing.Client to be reported to it after logging in.
+	waitingForTracingClient bool
 
 	// disableAccessRequest disables automatic resource access requests. Deprecated in favor of RequestType.
 	disableAccessRequest bool
@@ -641,6 +660,9 @@ type CLIConf struct {
 	// forkKillFd is the file descriptor for the child process to check the
 	// parent's state when re-execing.
 	forkKillFd uint64
+
+	// checkManagedUpdates initiates check of managed update after client connects to cluster.
+	checkManagedUpdates bool
 }
 
 func (c *CLIConf) isForkAuthChild() bool {
@@ -746,6 +768,7 @@ const (
 	bindAddrEnvVar            = "TELEPORT_LOGIN_BIND_ADDR"
 	browserEnvVar             = "TELEPORT_LOGIN_BROWSER"
 	proxyEnvVar               = "TELEPORT_PROXY"
+	relayEnvVar               = "TELEPORT_RELAY"
 	headlessEnvVar            = "TELEPORT_HEADLESS"
 	headlessSkipConfirmEnvVar = "TELEPORT_HEADLESS_SKIP_CONFIRM"
 	// TELEPORT_SITE uses the older deprecated "site" terminology to refer to a
@@ -769,6 +792,7 @@ const (
 	requestModeEnvVar         = "TELEPORT_REQUEST_MODE"
 	mcpClientConfigEnvVar     = "TELEPORT_MCP_CLIENT_CONFIG"
 	mcpConfigJSONFormatEnvVar = "TELEPORT_MCP_CONFIG_JSON_FORMAT"
+	toolsCheckUpdateEnvVar    = "TELEPORT_TOOLS_CHECK_UPDATE"
 
 	clusterHelp = "Specify the Teleport cluster to connect."
 	browserHelp = "Set to 'none' to suppress browser opening on login."
@@ -802,15 +826,28 @@ type CliOption func(*CLIConf) error
 //
 // DO NOT RUN TESTS that call Run() in parallel (unless you taken precautions).
 func Run(ctx context.Context, args []string, opts ...CliOption) error {
-	if err := tools.CheckAndUpdateLocal(ctx, args); err != nil {
-		return trace.Wrap(err)
-	}
-
 	cf := CLIConf{
 		Context:            ctx,
 		TracingProvider:    tracing.NoopProvider(),
 		DTAuthnRunCeremony: dtauthn.NewCeremony().Run,
 		DTAutoEnroll:       dtenroll.AutoEnroll,
+	}
+
+	// We need to parse the arguments before executing managed updates to identify
+	// the profile name and the required version for the current cluster.
+	// All other commands and flags may change between versions, so full parsing
+	// should be performed only after managed updates are applied.
+	var proxyArg string
+	muApp := utils.InitHiddenCLIParser()
+	muApp.Flag("proxy", "Teleport proxy address").Envar(proxyEnvVar).Hidden().StringVar(&proxyArg)
+	muApp.Flag("check-update", "Check for availability of managed update.").Envar(toolsCheckUpdateEnvVar).Hidden().BoolVar(&cf.checkManagedUpdates)
+	if _, err := muApp.Parse(utils.FilterArguments(args, muApp.Model())); err != nil {
+		slog.WarnContext(ctx, "can't identify current profile", "error", err)
+	}
+	// Check local update for specific proxy from configuration.
+	name := utils.TryHost(strings.TrimPrefix(strings.ToLower(proxyArg), "https://"))
+	if err := tools.CheckAndUpdateLocal(ctx, name, args); err != nil {
+		return trace.Wrap(err)
 	}
 
 	// run early to enable debug logging if env var is set.
@@ -828,6 +865,7 @@ func Run(ctx context.Context, args []string, opts ...CliOption) error {
 
 	app.Flag("login", "Remote host login.").Short('l').Envar(loginEnvVar).StringVar(&cf.NodeLogin)
 	app.Flag("proxy", "Teleport proxy address.").Envar(proxyEnvVar).StringVar(&cf.Proxy)
+	app.Flag("relay", "Teleport relay address, \"none\" to explicitly disable the use of a relay, or \"default\" to use the cluster-provided address even if a different address was specified at login time.").Envar(relayEnvVar).StringVar(&cf.Relay)
 	app.Flag("nocache", "Do not cache cluster discovery locally.").Hidden().BoolVar(&cf.NoCache)
 	app.Flag("user", "Teleport user, defaults to current local user.").Envar(userEnvVar).StringVar(&cf.Username)
 	app.Flag("mem-profile", "Write memory profile to file.").Hidden().StringVar(&memProfile)
@@ -893,6 +931,7 @@ func Run(ctx context.Context, args []string, opts ...CliOption) error {
 		StringVar(&cf.MlockMode)
 	app.HelpFlag.Short('h')
 	app.Flag("piv-slot", "Specify a PIV slot key to use for Hardware Key support instead of the default. Ex: \"9d\".").Envar("TELEPORT_PIV_SLOT").StringVar(&cf.PIVSlot)
+	app.Flag("check-update", "Check for availability of managed update.").Envar(toolsCheckUpdateEnvVar).Hidden().BoolVar(&cf.checkManagedUpdates)
 
 	ver := app.Command("version", "Print the tsh client and Proxy server versions for the current context.")
 	ver.Flag("format", defaults.FormatFlagDescription(defaults.DefaultFormats...)).Short('f').Default(teleport.Text).EnumVar(&cf.Format, defaults.DefaultFormats...)
@@ -1027,6 +1066,8 @@ func Run(ctx context.Context, args []string, opts ...CliOption) error {
 	proxyDB := proxy.Command("db", "Start local TLS proxy for database connections when using Teleport in single-port mode.")
 	// don't require <db> positional argument, user can select with --labels/--query alone.
 	proxyDB.Arg("db", "The name of the database to start local proxy for.").StringVar(&cf.DatabaseService)
+	proxyDB.Flag("insecure-listen-anywhere", "Allows the local proxy to listen on any address without restrictions. WARNING: this will expose unsecured listener to anyone in the network. Only use when network access is otherwise restricted.").BoolVar(&cf.InsecureListenAnywhere)
+	proxyDB.Flag("listen", "Specifies the source address used by proxy db listener. Mutually exclusive with --port.").StringVar(&cf.LocalProxyAddr)
 	proxyDB.Flag("port", "Specifies the source port used by proxy db listener.").Short('p').StringVar(&cf.LocalProxyPort)
 	proxyDB.Flag("tunnel", "Open authenticated tunnel using database's client certificate so clients don't need to authenticate.").BoolVar(&cf.LocalProxyTunnel)
 	proxyDB.Flag("db-user", "Database user to log in as.").Short('u').StringVar(&cf.DatabaseUser)
@@ -1191,6 +1232,7 @@ func Run(ctx context.Context, args []string, opts ...CliOption) error {
 	login.Flag("request-nowait", "Finish without waiting for request resolution.").BoolVar(&cf.NoWait)
 	login.Flag("request-id", "Login with the roles requested in the given request.").StringVar(&cf.RequestID)
 	login.Arg("cluster", clusterHelp).StringVar(&cf.SiteName)
+	login.Flag("scope", "Scope pins credentials to a given scope.").StringVar(&cf.Scope)
 	login.Flag("browser", browserHelp).StringVar(&cf.Browser)
 	login.Flag("kube-cluster", "Name of the Kubernetes cluster to login to.").StringVar(&cf.KubernetesCluster)
 	login.Flag("verbose", "Show extra status information.").Short('v').BoolVar(&cf.Verbose)
@@ -1391,6 +1433,9 @@ func Run(ctx context.Context, args []string, opts ...CliOption) error {
 		puttyConfig.Hidden()
 	}
 
+	// Client-tools managed updates commands.
+	updateCommand := newUpdateCommand(app)
+
 	// FIDO2, TouchID and WebAuthnWin commands.
 	f2 := fido2.NewCommand(app)
 	tid := touchid.NewCommand(app)
@@ -1399,7 +1444,6 @@ func Run(ctx context.Context, args []string, opts ...CliOption) error {
 	// Device Trust commands.
 	deviceCmd := newDeviceCommand(app)
 
-	svidCmd := newSVIDCommands(app)
 	workloadIdentityCmd := newWorkloadIdentityCommands(app)
 
 	vnetCommand := newVnetCommand(app)
@@ -1422,6 +1466,9 @@ func Run(ctx context.Context, args []string, opts ...CliOption) error {
 	cf.executablePath, err = os.Executable()
 	if err != nil {
 		return trace.Wrap(err)
+	}
+	if reExecPath := tools.GetReExecPath(); reExecPath != "" {
+		cf.executablePath = reExecPath
 	}
 
 	// configs
@@ -1596,7 +1643,7 @@ func Run(ctx context.Context, args []string, opts ...CliOption) error {
 	case ver.FullCommand():
 		err = onVersion(&cf)
 	case ssh.FullCommand():
-		err = onSSH(&cf)
+		err = onSSH(&cf, wrapInitClientWithUpdateCheck(makeClient, args))
 	case resolve.FullCommand():
 		err = onResolve(&cf)
 		// If quiet was specified for this command and
@@ -1729,7 +1776,7 @@ func Run(ctx context.Context, args []string, opts ...CliOption) error {
 	case scan.keys.FullCommand():
 		err = scan.keys.run(&cf)
 	case proxySSH.FullCommand():
-		err = onProxyCommandSSH(&cf)
+		err = onProxyCommandSSH(&cf, wrapInitClientWithUpdateCheck(makeClient, args))
 	case proxyDB.FullCommand():
 		err = onProxyCommandDB(&cf)
 	case proxyApp.FullCommand():
@@ -1818,8 +1865,6 @@ func Run(ctx context.Context, args []string, opts ...CliOption) error {
 		err = onKubectlCommand(&cf, args, args[idx:])
 	case headlessApprove.FullCommand():
 		err = onHeadlessApprove(&cf)
-	case svidCmd.issue.FullCommand():
-		err = svidCmd.issue.run(&cf)
 	case workloadIdentityCmd.issueX509.FullCommand():
 		err = workloadIdentityCmd.issueX509.run(&cf)
 	case vnetCommand.FullCommand():
@@ -1858,6 +1903,8 @@ func Run(ctx context.Context, args []string, opts ...CliOption) error {
 		err = mcpCmd.list.run()
 	case mcpCmd.config.FullCommand():
 		err = mcpCmd.config.run()
+	case updateCommand.update.FullCommand():
+		err = updateCommand.update.run(&cf)
 	default:
 		// Handle commands that might not be available.
 		switch {
@@ -1930,18 +1977,35 @@ func initializeTracing(cf *CLIConf) func() {
 		cf.TracingProvider = provider
 		cf.tracer = provider.Tracer(teleport.ComponentTSH)
 		return flush(provider)
-	// The login command cannot forward spans to Auth since there is no way to get
-	// an authenticated client to forward with until after the authentication ceremony
-	// is complete. However, if the user explicitly provided an exporter then the login
-	// spans can be sent directly to it.
-	case cf.command == "login":
-		return func() {}
 	// All commands besides ssh are only traced if the user explicitly requested
 	// tracing. For ssh, a random number of spans may be sampled if the Proxy is
 	// for a Cloud tenant.
 	case !cf.SampleTraces:
 		return func() {}
 	case cf.SampleTraces:
+	}
+
+	// A login may be required to get a working Teleport client. Set up the
+	// tracing provider to wait for a client so that the initial login can be
+	// traced. Spans will be buffered in memory until the client is provided.
+	provider, err := tracing.NewTraceProvider(cf.Context,
+		tracing.Config{
+			Service:              teleport.ComponentTSH,
+			SamplingRate:         samplingRate,
+			WaitForDelayedClient: true,
+		})
+	if err != nil {
+		logger.DebugContext(cf.Context, "failed to set up span forwarding", "error", err)
+		return func() {}
+	}
+	cf.TracingProvider = provider
+	cf.tracer = provider.Tracer(teleport.ComponentTSH)
+
+	if cf.command == "login" {
+		// Don't call RetryWithRelogin below if the user is trying to log in.
+		// Rely on [onLogin] to set the delayed client on the tracing provider.
+		cf.waitingForTracingClient = true
+		return flush(provider)
 	}
 
 	// Parse the config to determine if forwarding is needed for Cloud and
@@ -1952,32 +2016,20 @@ func initializeTracing(cf *CLIConf) func() {
 		return func() {}
 	}
 
-	var provider *tracing.Provider
 	if err := client.RetryWithRelogin(cf.Context, tc, func() error {
 		clt, err := tc.NewTracingClient(cf.Context)
 		if err != nil {
 			return trace.Wrap(err)
 		}
-
-		p, err := tracing.NewTraceProvider(cf.Context,
-			tracing.Config{
-				Service:      teleport.ComponentTSH,
-				Client:       clt,
-				SamplingRate: samplingRate,
-			})
-		if err != nil {
+		if err := provider.SetClient(cf.Context, clt); err != nil {
 			return trace.NewAggregate(err, clt.Close())
 		}
-
-		provider = p
 		return nil
 	}); err != nil {
 		logger.DebugContext(cf.Context, "failed to set up span forwarding", "error", err)
 		return func() {}
 	}
 
-	cf.TracingProvider = provider
-	cf.tracer = provider.Tracer(teleport.ComponentTSH)
 	return flush(provider)
 }
 
@@ -2082,7 +2134,8 @@ func serializeVersion(format string, proxyVersion string, proxyPublicAddress str
 }
 
 // onLogin logs in with remote proxy and gets signed certificates
-func onLogin(cf *CLIConf, reExecArgs ...string) error {
+func onLogin(cf *CLIConf, reExecArgs ...string) (err error) {
+	showAlerts := true
 	autoRequest := true
 	// special case: --request-roles=no disables auto-request behavior.
 	if cf.DesiredRoles == "no" {
@@ -2117,10 +2170,49 @@ func onLogin(cf *CLIConf, reExecArgs ...string) error {
 		}
 	}
 
+	if cf.Scope != "" {
+		// auto-request behavior is incompatible with scopes
+		autoRequest = false
+		// alerts don't support scoping yet, reduce log spam by disabling lookup attempts
+		showAlerts = false
+
+		// client-side validation of scopes isn't strictly necessary, but scope syntax is easy to mess
+		// up (especially accidentally omitting the leading slash), so its nice to find out if the scope
+		// is malformed before going through authentication.
+		if err := scopes.StrongValidate(cf.Scope); err != nil {
+			return trace.Wrap(err)
+		}
+
+		// TODO(fspmarshall/scopes): this is a clunky way to handle the forced reauth on scope change,
+		// look into doing something smarter.
+		profile, profiles = nil, nil
+	}
+
 	// make the teleport client and retrieve the certificate from the proxy:
 	tc, err := makeClient(cf)
 	if err != nil {
 		return trace.Wrap(err)
+	}
+
+	// If the user requested tracing and the login succeeds (even if the user
+	// was already logged in) report the tracing client to the trace provider
+	// to that spans can be exported.
+	if cf.waitingForTracingClient {
+		defer func() {
+			if err != nil {
+				logger.DebugContext(cf.Context, "Login failed, unable to export traced spans")
+				return
+			}
+			tracingClient, err := tc.NewTracingClient(cf.Context)
+			if err != nil {
+				logger.DebugContext(cf.Context, "Failed to create tracing client after login", "error", err)
+				return
+			}
+			if err := cf.TracingProvider.SetClient(cf.Context, tracingClient); err != nil {
+				logger.DebugContext(cf.Context, "Failed to set tracing client on trace provider after login", "error", err)
+				tracingClient.Close()
+			}
+		}()
 	}
 
 	// The user is not logged in and has typed in `tsh --proxy=... login`, if
@@ -2140,7 +2232,7 @@ func onLogin(cf *CLIConf, reExecArgs ...string) error {
 		// in case if parameters match, re-fetch kube clusters and print
 		// current status
 		case cf.Proxy == "" && cf.SiteName == "" && cf.DesiredRoles == "" && cf.RequestID == "" && cf.IdentityFileOut == "" ||
-			host(cf.Proxy) == host(profile.ProxyURL.Host) && cf.SiteName == profile.Cluster && cf.DesiredRoles == "" && cf.RequestID == "":
+			utils.TryHost(cf.Proxy) == utils.TryHost(profile.ProxyURL.Host) && cf.SiteName == profile.Cluster && cf.DesiredRoles == "" && cf.RequestID == "":
 
 			// The user has typed `tsh login`, if the running binary needs to
 			// be updated, update and re-exec.
@@ -2156,10 +2248,10 @@ func onLogin(cf *CLIConf, reExecArgs ...string) error {
 				return trace.Wrap(err)
 			}
 
-			return trace.Wrap(printLoginInformation(cf, profile, profiles, cf.getAccessListsToReview(tc)))
+			return trace.Wrap(printLoginInformation(cf, profile, profiles))
 
 		// if the proxy names match but nothing else is specified; show motd and update active profile and kube configs
-		case host(cf.Proxy) == host(profile.ProxyURL.Host) &&
+		case utils.TryHost(cf.Proxy) == utils.TryHost(profile.ProxyURL.Host) &&
 			cf.SiteName == "" && cf.DesiredRoles == "" && cf.RequestID == "" && cf.IdentityFileOut == "":
 
 			// The user has typed `tsh login`, if the running binary needs to
@@ -2186,13 +2278,13 @@ func onLogin(cf *CLIConf, reExecArgs ...string) error {
 				}
 
 				// Print status to show information of the logged in user.
-				return trace.Wrap(printLoginInformation(cf, profile, profiles, cf.getAccessListsToReview(tc)))
+				return trace.Wrap(printLoginInformation(cf, profile, profiles))
 			}
 
 		// proxy is unspecified or the same as the currently provided proxy,
 		// but cluster is specified, treat this as selecting a new cluster
 		// for the same proxy
-		case (cf.Proxy == "" || host(cf.Proxy) == host(profile.ProxyURL.Host)) && cf.SiteName != "":
+		case (cf.Proxy == "" || utils.TryHost(cf.Proxy) == utils.TryHost(profile.ProxyURL.Host)) && cf.SiteName != "":
 			_, err := tc.PingAndShowMOTD(cf.Context)
 			if err != nil {
 				return trace.Wrap(err)
@@ -2218,11 +2310,11 @@ func onLogin(cf *CLIConf, reExecArgs ...string) error {
 			}
 
 			// Print status to show information of the logged in user.
-			return trace.Wrap(printLoginInformation(cf, profile, profiles, cf.getAccessListsToReview(tc)))
+			return trace.Wrap(printLoginInformation(cf, profile, profiles))
 		// proxy is unspecified or the same as the currently provided proxy,
 		// but desired roles or request ID is specified, treat this as a
 		// privilege escalation request for the same login session.
-		case (cf.Proxy == "" || host(cf.Proxy) == host(profile.ProxyURL.Host)) && (cf.DesiredRoles != "" || cf.RequestID != "") && cf.IdentityFileOut == "":
+		case (cf.Proxy == "" || utils.TryHost(cf.Proxy) == utils.TryHost(profile.ProxyURL.Host)) && (cf.DesiredRoles != "" || cf.RequestID != "") && cf.IdentityFileOut == "":
 			_, err := tc.PingAndShowMOTD(cf.Context)
 			if err != nil {
 				return trace.Wrap(err)
@@ -2234,7 +2326,7 @@ func onLogin(cf *CLIConf, reExecArgs ...string) error {
 				return trace.Wrap(err)
 			}
 			// Print status to show information of the logged in user.
-			return trace.Wrap(printLoginInformation(cf, profile, profiles, cf.getAccessListsToReview(tc)))
+			return trace.Wrap(printLoginInformation(cf, profile, profiles))
 
 		// otherwise just pass through to standard login
 		default:
@@ -2274,7 +2366,6 @@ func onLogin(cf *CLIConf, reExecArgs ...string) error {
 		}
 		return trace.Wrap(err)
 	}
-
 	tc.AllowStdinHijack = false
 
 	// the login operation may update the username and should be considered the more
@@ -2339,6 +2430,16 @@ func onLogin(cf *CLIConf, reExecArgs ...string) error {
 		}
 	}
 
+	// at login time we store the CLI override for the relay address in the profile
+	switch cf.Relay {
+	case "", "default":
+		tc.ProfileRelayAddr = ""
+	case "none":
+		tc.ProfileRelayAddr = "none"
+	default:
+		tc.ProfileRelayAddr = cf.Relay
+	}
+
 	// Regular login without -i flag.
 	if err := tc.SaveProfile(true); err != nil {
 		return trace.Wrap(err)
@@ -2385,7 +2486,7 @@ func onLogin(cf *CLIConf, reExecArgs ...string) error {
 	}
 
 	// Print status to show information of the logged in user.
-	if err := printLoginInformation(cf, profile, profiles, cf.getAccessListsToReview(tc)); err != nil {
+	if err := printLoginInformation(cf, profile, profiles); err != nil {
 		return trace.Wrap(err)
 	}
 
@@ -2393,10 +2494,12 @@ func onLogin(cf *CLIConf, reExecArgs ...string) error {
 	// don't use the alert API very heavily. If we start to make more use of it, we
 	// could probably add a separate `tsh alerts ls` command, and truncate the list
 	// with a message like "run 'tsh alerts ls' to view N additional alerts".
-	if err := common.ShowClusterAlerts(cf.Context, clusterClient.CurrentCluster(), os.Stderr, map[string]string{
-		types.AlertOnLogin: "yes",
-	}, types.AlertSeverity_LOW); err != nil {
-		logger.WarnContext(cf.Context, "Failed to display cluster alerts", "error", err)
+	if showAlerts {
+		if err := common.ShowClusterAlerts(cf.Context, clusterClient.CurrentCluster(), os.Stderr, map[string]string{
+			types.AlertOnLogin: "yes",
+		}, types.AlertSeverity_LOW); err != nil {
+			logger.WarnContext(cf.Context, "Failed to display cluster alerts", "error", err)
+		}
 	}
 
 	return nil
@@ -3800,8 +3903,15 @@ func getAutoResourceRequest(ctx context.Context, tc *client.TeleportClient, requ
 	req.SetDryRun(true)
 	req.SetRequestReason("Dry run, this request will not be created. If you see this, there is a bug.")
 	if err := tc.WithRootClusterClient(ctx, func(clt authclient.ClientI) error {
-		req, err = clt.CreateAccessRequestV2(ctx, req)
-		return trace.Wrap(err)
+		dryRunReq, err := clt.CreateAccessRequestV2(ctx, req)
+		if err != nil {
+			return trace.Wrap(err)
+		}
+		// Copying the computed roles here is not strictly necessary but avoids requiring
+		// the server to recompute the roles when the real request is created, which can be
+		// an expensive operation.
+		req.SetRoles(dryRunReq.GetRoles())
+		return nil
 	}); err != nil {
 		return nil, trace.Wrap(err)
 	}
@@ -4102,7 +4212,7 @@ func onResolve(cf *CLIConf) error {
 }
 
 // onSSH executes 'tsh ssh' command
-func onSSH(cf *CLIConf) error {
+func onSSH(cf *CLIConf, initFunc ClientInitFunc) error {
 	// Handle fork after authentication.
 	var disownSignal *os.File
 	var forkAuthSuccessful atomic.Bool
@@ -4151,7 +4261,7 @@ func onSSH(cf *CLIConf) error {
 		return trace.BadParameter("required argument '[user@]host' not provided")
 	}
 
-	tc, err := makeClient(cf)
+	tc, err := initFunc(cf)
 	if err != nil {
 		return trace.Wrap(err)
 	}
@@ -4365,6 +4475,23 @@ func onSCP(cf *CLIConf) error {
 func makeClient(cf *CLIConf) (*client.TeleportClient, error) {
 	tc, err := makeClientForProxy(cf, cf.Proxy)
 	return tc, trace.Wrap(err)
+}
+
+// wrapInitClientWithUpdateCheck wraps the client initialization function to the Teleport cluster,
+// adding a managed update check immediately after the connection is established.
+func wrapInitClientWithUpdateCheck(clientInitFunc ClientInitFunc, reExecArgs []string) ClientInitFunc {
+	return func(cf *CLIConf) (*client.TeleportClient, error) {
+		tc, err := clientInitFunc(cf)
+		if err != nil {
+			return nil, trace.Wrap(err)
+		}
+		if cf.checkManagedUpdates {
+			if err := tools.CheckAndUpdateRemote(cf.Context, tc.WebProxyAddr, tc.InsecureSkipVerify, reExecArgs); err != nil {
+				return nil, trace.Wrap(err)
+			}
+		}
+		return tc, nil
+	}
 }
 
 // makeClient takes the command-line configuration and a proxy address and constructs & returns
@@ -4654,6 +4781,10 @@ func loadClientConfigFromCLIConf(cf *CLIConf, proxy string) (*client.Config, err
 	if len(rPorts) > 0 {
 		c.RemoteForwardPorts = rPorts
 	}
+
+	// TODO(fspmarshall/scopes): decide if we want some kind of persistence for the CLI arg.
+	c.Scope = cf.Scope
+
 	if cf.SiteName != "" {
 		c.SiteName = cf.SiteName
 	}
@@ -4785,6 +4916,17 @@ func loadClientConfigFromCLIConf(cf *CLIConf, proxy string) (*client.Config, err
 	c.DisplayParticipantRequirements = cf.displayParticipantRequirements
 	c.SSHLogDir = cf.SSHLogDir
 	c.DisableSSHResumption = cf.DisableSSHResumption
+
+	switch cf.Relay {
+	case "":
+	case "none":
+		c.RelayAddr = ""
+	case "default":
+		c.RelayAddr = c.ProfileDefaultRelayAddr
+	default:
+		c.RelayAddr = cf.Relay
+	}
+
 	return c, nil
 }
 
@@ -5105,6 +5247,20 @@ func printStatus(debug bool, p *profileInfo, env map[string]string, isActive boo
 	}
 
 	fmt.Printf("%vProfile URL:        %v\n", prefix, proxyURL)
+	if debug {
+		switch {
+		case p.RelayAddr == "" && p.DefaultRelayAddr != "":
+			fmt.Printf("  Relay address:      %v (default)\n", p.DefaultRelayAddr)
+		case p.RelayAddr != "" && p.DefaultRelayAddr != "":
+			fmt.Printf("  Relay address:      %v (default: %v)\n", p.RelayAddr, p.DefaultRelayAddr)
+		case p.RelayAddr != "" && p.DefaultRelayAddr == "":
+			fmt.Printf("  Relay address:      %v (no default)\n", p.RelayAddr)
+		default:
+			fmt.Printf("  Relay address:      (none)\n")
+		}
+	} else if relayAddr := cmp.Or(p.RelayAddr, p.DefaultRelayAddr); relayAddr != "" {
+		fmt.Printf("  Relay address:      %v\n", relayAddr)
+	}
 	fmt.Printf("  Logged in as:       %v\n", p.Username)
 	if len(p.ActiveRequests) != 0 {
 		fmt.Printf("  Active requests:    %v\n", strings.Join(p.ActiveRequests, ", "))
@@ -5113,10 +5269,24 @@ func printStatus(debug bool, p *profileInfo, env map[string]string, isActive boo
 	if cluster != "" {
 		fmt.Printf("  Cluster:            %v\n", cluster)
 	}
-	fmt.Printf("  Roles:              %v\n", rolesToString(debug, p.Roles))
+	if p.Scope != "" {
+		fmt.Printf("  Scope:              %v\n", p.Scope)
+		fmt.Printf("  Scoped Roles:\n")
+
+		assignedScopes := slices.Collect(maps.Keys(p.ScopedRoles))
+		slices.Sort(assignedScopes)
+		for _, scope := range assignedScopes {
+			fmt.Printf("    %s: %v\n", scope, rolesToString(debug, p.ScopedRoles[scope]))
+		}
+	} else {
+		fmt.Printf("  Roles:              %v\n", rolesToString(debug, p.Roles))
+	}
 	if debug {
 		var count int
 		for k, v := range p.Traits {
+			if len(v) == 0 {
+				continue
+			}
 			if count == 0 {
 				fmt.Printf("  Traits:             %v: %v\n", k, v)
 			} else {
@@ -5204,7 +5374,7 @@ func rolesToString(debug bool, roles []string) string {
 }
 
 // printLoginInformation displays the provided profile information to the user.
-func printLoginInformation(cf *CLIConf, profile *client.ProfileStatus, profiles []*client.ProfileStatus, accessListsToReview []*accesslist.AccessList) error {
+func printLoginInformation(cf *CLIConf, profile *client.ProfileStatus, profiles []*client.ProfileStatus) error {
 	env := getTshEnv()
 	active, others := makeAllProfileInfo(profile, profiles, env)
 
@@ -5242,21 +5412,6 @@ func printLoginInformation(cf *CLIConf, profile *client.ProfileStatus, profiles 
 		}
 	}
 
-	if len(accessListsToReview) > 0 {
-		fmt.Printf("Access lists that need to be reviewed:\n")
-		for _, accessList := range accessListsToReview {
-			var msg string
-			nextAuditDate := accessList.Spec.Audit.NextAuditDate.Format(time.DateOnly)
-			if time.Now().After(accessList.Spec.Audit.NextAuditDate) {
-				msg = fmt.Sprintf("review is overdue (%v)", nextAuditDate)
-			} else {
-				msg = fmt.Sprintf("review is required by %v", nextAuditDate)
-			}
-			fmt.Printf("\t%s (%v)\n", accessList.Spec.Title, msg)
-		}
-		fmt.Println()
-	}
-
 	return nil
 }
 
@@ -5287,13 +5442,7 @@ func onStatus(cf *CLIConf) error {
 	// hardware key touch or require a PIN.
 	hardwareKeyInteractionRequired := tc.PrivateKeyPolicy.MFAVerified()
 
-	var accessListsToReview []*accesslist.AccessList
-	if hardwareKeyInteractionRequired {
-		logger.DebugContext(cf.Context, "Skipping fetching access lists to review due to Hardware Key PIN/Touch requirement")
-	} else {
-		accessListsToReview = cf.getAccessListsToReview(tc)
-	}
-	if err := printLoginInformation(cf, profile, profiles, accessListsToReview); err != nil {
+	if err := printLoginInformation(cf, profile, profiles); err != nil {
 		return trace.Wrap(err)
 	}
 
@@ -5320,10 +5469,14 @@ func onStatus(cf *CLIConf) error {
 
 type profileInfo struct {
 	ProxyURL           string                 `json:"profile_url"`
+	RelayAddr          string                 `json:"relay_addr,omitempty"`
+	DefaultRelayAddr   string                 `json:"default_relay_addr,omitempty"`
 	Username           string                 `json:"username"`
 	ActiveRequests     []string               `json:"active_requests,omitempty"`
 	Cluster            string                 `json:"cluster"`
 	Roles              []string               `json:"roles,omitempty"`
+	Scope              string                 `json:"scope,omitempty"`
+	ScopedRoles        map[string][]string    `json:"scoped_roles,omitempty"`
 	Traits             wrappers.Traits        `json:"traits,omitempty"`
 	Logins             []string               `json:"logins,omitempty"`
 	KubernetesEnabled  bool                   `json:"kubernetes_enabled"`
@@ -5370,10 +5523,14 @@ func makeProfileInfo(p *client.ProfileStatus, env map[string]string, isActive bo
 	selectedKubeCluster, _ := kubeconfig.SelectedKubeCluster("", p.Cluster)
 	out := &profileInfo{
 		ProxyURL:           p.ProxyURL.String(),
+		RelayAddr:          p.RelayAddr,
+		DefaultRelayAddr:   p.DefaultRelayAddr,
 		Username:           p.Username,
 		ActiveRequests:     p.ActiveRequests,
 		Cluster:            p.Cluster,
 		Roles:              p.Roles,
+		Scope:              p.Scope,
+		ScopedRoles:        p.ScopedRoles,
 		Traits:             p.Traits,
 		Logins:             logins,
 		KubernetesEnabled:  p.KubeEnabled,
@@ -5472,17 +5629,6 @@ func getTshEnv() map[string]string {
 		}
 	}
 	return env
-}
-
-// host is a utility function that extracts
-// host from the host:port pair, in case of any error
-// returns the original value
-func host(in string) string {
-	out, err := utils.Host(in)
-	if err != nil {
-		return in
-	}
-	return out
 }
 
 func awaitRequestResolution(ctx context.Context, clt authclient.ClientI, req types.AccessRequest) (types.AccessRequest, error) {
@@ -5992,28 +6138,6 @@ func onHeadlessApprove(cf *CLIConf) error {
 		return tc.HeadlessApprove(cf.Context, cf.HeadlessAuthenticationID, !cf.headlessSkipConfirm)
 	})
 	return trace.Wrap(err)
-}
-
-// getAccessListsToReview will return access lists that the logged in user needs to review. On error,
-// this will return an empty list.
-func (cf *CLIConf) getAccessListsToReview(tc *client.TeleportClient) []*accesslist.AccessList {
-	clusterClient, err := tc.ConnectToCluster(cf.Context)
-	if err != nil {
-		logger.DebugContext(cf.Context, "Error connecting to the cluster", "error", err)
-		return nil
-	}
-	defer func() {
-		clusterClient.Close()
-	}()
-
-	// Get the access lists to review. If the call returns NotImplemented, ignore it, as we may be communicating with an OSS
-	// server, which does not support access lists.
-	accessListsToReview, err := clusterClient.AuthClient.AccessListClient().GetAccessListsToReview(cf.Context)
-	if err != nil && !trace.IsNotImplemented(err) {
-		logger.DebugContext(cf.Context, "Error getting access lists to review", "error", err)
-	}
-
-	return accessListsToReview
 }
 
 var mlockModes = []string{mlockModeNo, mlockModeAuto, mlockModeBestEffort, mlockModeStrict}

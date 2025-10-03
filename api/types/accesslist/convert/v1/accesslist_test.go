@@ -17,6 +17,7 @@ limitations under the License.
 package v1
 
 import (
+	stdcmp "cmp"
 	"testing"
 	"time"
 
@@ -110,7 +111,13 @@ func TestRoundtrip(t *testing.T) {
 			},
 		},
 		{
-			name: "dynamic-type",
+			name: "deprecated-dynamic-type",
+			modificationFn: func(accessList *accesslist.AccessList) {
+				accessList.Spec.Type = accesslist.DeprecatedDynamic
+			},
+		},
+		{
+			name: "default-type",
 			modificationFn: func(accessList *accesslist.AccessList) {
 				accessList.Spec.Type = accesslist.Default
 			},
@@ -136,18 +143,13 @@ func TestRoundtrip(t *testing.T) {
 			converted, err := FromProto(ToProto(accessList))
 			require.NoError(t, err)
 
+			if accessList.Spec.Type == accesslist.DeprecatedDynamic {
+				accessList.Spec.Type = accesslist.Default
+			}
+
 			require.Empty(t, cmp.Diff(accessList, converted))
 		})
 	}
-}
-
-func Test_FromProto_withBadType(t *testing.T) {
-	accessList := newAccessList(t, "access-list")
-	accessList.Spec.Type = "test_bad_type"
-
-	_, err := FromProto(ToProto(accessList))
-	require.Error(t, err)
-	require.ErrorContains(t, err, `unknown access_list type "test_bad_type"`)
 }
 
 // Make sure that we don't panic if any of the message fields are missing.
@@ -167,7 +169,7 @@ func TestFromProtoNils(t *testing.T) {
 		accessList.Spec.Owners = nil
 
 		_, err := FromProto(accessList)
-		require.Error(t, err)
+		require.NoError(t, err)
 	})
 
 	t.Run("audit", func(t *testing.T) {
@@ -216,6 +218,20 @@ func TestFromProtoNils(t *testing.T) {
 
 		_, err := FromProto(msg)
 		require.NoError(t, err)
+	})
+
+	t.Run("requires is not set to nil", func(t *testing.T) {
+		acl := newAccessList(t, "access-list")
+		acl.Spec.MembershipRequires = accesslist.Requires{}
+		acl.Spec.OwnershipRequires = accesslist.Requires{}
+		msg := ToProto(acl)
+		// Ensure Requires fields are not set to nil for backward compatibility.
+		// Older implementations of FromProto (e.g., in Teleport v16) may incorrectly set these fields to nil:
+		// https://github.com/gravitational/teleport/blob/branch/v16/api/types/accesslist/convert/v1/accesslist.go#L46
+		// Since FromProto is invoked client-side (e.g., by the Terraform provider),
+		// setting Requires to nil could introduce breaking changes for existing clients.
+		require.NotNil(t, msg.Spec.MembershipRequires)
+		require.NotNil(t, msg.Spec.OwnershipRequires)
 	})
 }
 
@@ -309,109 +325,146 @@ func TestNextAuditDateZeroTime(t *testing.T) {
 func TestConvAccessList(t *testing.T) {
 	t.Parallel()
 
+	newAccessList := func(modifyFn func(*accesslistv1.AccessList)) *accesslistv1.AccessList {
+		al := &accesslistv1.AccessList{
+			Header: &v1.ResourceHeader{
+				Version: "v1",
+				Kind:    types.KindAccessList,
+				Metadata: &v1.Metadata{
+					Name: "access-list",
+				},
+			},
+			Spec: &accesslistv1.AccessListSpec{
+				Title:              "test access list",
+				Description:        "test description",
+				OwnershipRequires:  &accesslistv1.AccessListRequires{},
+				MembershipRequires: &accesslistv1.AccessListRequires{},
+				Owners: []*accesslistv1.AccessListOwner{
+					{
+						Name: "test-user1",
+					},
+				},
+				Audit: &accesslistv1.AccessListAudit{
+					Recurrence: &accesslistv1.Recurrence{
+						Frequency:  1,
+						DayOfMonth: 1,
+					},
+					NextAuditDate: &timestamppb.Timestamp{
+						Seconds: 6,
+						Nanos:   1,
+					},
+					Notifications: &accesslistv1.Notifications{
+						Start: &durationpb.Duration{
+							Seconds: 1209600,
+						},
+					},
+				},
+				Grants: &accesslistv1.AccessListGrants{
+					Roles: []string{"role1"},
+				},
+			},
+			Status: &accesslistv1.AccessListStatus{},
+		}
+		if modifyFn != nil {
+			modifyFn(al)
+		}
+		return al
+	}
+
 	tests := []struct {
 		name  string
 		input *accesslistv1.AccessList
 	}{
 		{
-			name: "basic conversion",
-			input: &accesslistv1.AccessList{
-				Header: &v1.ResourceHeader{
-					Version: "v1",
-					Kind:    types.KindAccessList,
-					Metadata: &v1.Metadata{
-						Name: "access-list",
-					},
-				},
-				Spec: &accesslistv1.AccessListSpec{
-					Title:       "test access list",
-					Description: "test description",
-					Owners: []*accesslistv1.AccessListOwner{
-						{
-							Name: "test-user1",
-						},
-					},
-					Audit: &accesslistv1.AccessListAudit{
-						Recurrence: &accesslistv1.Recurrence{
-							Frequency:  1,
-							DayOfMonth: 1,
-						},
-						NextAuditDate: &timestamppb.Timestamp{
-							Seconds: 6,
-							Nanos:   1,
-						},
-						Notifications: &accesslistv1.Notifications{
-							Start: &durationpb.Duration{
-								Seconds: 1209600,
-							},
-						},
-					},
-					Grants: &accesslistv1.AccessListGrants{
-						Roles: []string{"role1"},
-					},
-				},
-				Status: &accesslistv1.AccessListStatus{},
-			},
+			name:  "basic conversion",
+			input: newAccessList(nil),
 		},
 		{
 			name: "nil grants",
-			input: &accesslistv1.AccessList{
-				Header: &v1.ResourceHeader{
-					Version: "v1",
-					Kind:    types.KindAccessList,
-					Metadata: &v1.Metadata{
-						Name: "access-list",
-					},
-				},
-				Spec: &accesslistv1.AccessListSpec{
-					Title:       "test access list",
-					Description: "test description",
-					Owners: []*accesslistv1.AccessListOwner{
-						{
-							Name: "test-user1",
-						},
-					},
-					Audit: &accesslistv1.AccessListAudit{
-						Recurrence: &accesslistv1.Recurrence{
-							Frequency:  1,
-							DayOfMonth: 1,
-						},
-						NextAuditDate: &timestamppb.Timestamp{
-							Seconds: 6,
-							Nanos:   1,
-						},
-						Notifications: &accesslistv1.Notifications{
-							Start: &durationpb.Duration{
-								Seconds: 1209600,
-							},
-						},
-					},
-					Grants: nil,
-				},
-				Status: &accesslistv1.AccessListStatus{},
-			},
+			input: newAccessList(func(al *accesslistv1.AccessList) {
+				al.Spec.Grants = nil
+			}),
 		},
 		{
 			name: "SCIM, Static access list allows for empty owners",
-			input: &accesslistv1.AccessList{
-				Header: &v1.ResourceHeader{
-					Version: "v1",
-					Kind:    types.KindAccessList,
-					Metadata: &v1.Metadata{
-						Name: "access-list",
+			input: newAccessList(func(al *accesslistv1.AccessList) {
+				al.Spec.Type = string(accesslist.SCIM)
+				al.Spec.Owners = []*accesslistv1.AccessListOwner{}
+			}),
+		},
+		{
+			name: "audit with only Recurrence.DayOfMonth set",
+			input: newAccessList(func(al *accesslistv1.AccessList) {
+				al.Spec.Type = string(accesslist.SCIM)
+				al.Spec.Audit = &accesslistv1.AccessListAudit{
+					Recurrence: &accesslistv1.Recurrence{
+						DayOfMonth: accesslistv1.ReviewDayOfMonth_REVIEW_DAY_OF_MONTH_LAST,
 					},
-				},
-				Spec: &accesslistv1.AccessListSpec{
-					Type:        string(accesslist.SCIM),
-					Title:       "test access list",
-					Description: "test description",
-					Owners:      []*accesslistv1.AccessListOwner{},
-					Grants: &accesslistv1.AccessListGrants{
-						Roles: []string{"role1"},
+					Notifications: &accesslistv1.Notifications{
+						Start: &durationpb.Duration{
+							Seconds: 12345,
+						},
 					},
-				},
-				Status: &accesslistv1.AccessListStatus{},
-			},
+				}
+			}),
+		},
+		{
+			name: "audit with only Recurrence.Frequency and Notifications.Start set",
+			input: newAccessList(func(al *accesslistv1.AccessList) {
+				al.Spec.Type = string(accesslist.SCIM)
+				al.Spec.Audit = &accesslistv1.AccessListAudit{
+					Recurrence: &accesslistv1.Recurrence{
+						Frequency: accesslistv1.ReviewFrequency_REVIEW_FREQUENCY_ONE_YEAR,
+					},
+					Notifications: &accesslistv1.Notifications{
+						Start: &durationpb.Duration{},
+					},
+				}
+			}),
+		},
+		{
+			name: "scim-type",
+			input: newAccessList(func(al *accesslistv1.AccessList) {
+				al.Spec.Type = string(accesslist.SCIM)
+			}),
+		},
+		{
+			name: "static-type",
+			input: newAccessList(func(al *accesslistv1.AccessList) {
+				al.Spec.Type = string(accesslist.SCIM)
+			}),
+		},
+		{
+			name: "scim-type and zero audit",
+			input: newAccessList(func(al *accesslistv1.AccessList) {
+				al.Spec.Type = string(accesslist.SCIM)
+				al.Spec.Audit = &accesslistv1.AccessListAudit{
+					NextAuditDate: &timestamppb.Timestamp{},
+					Recurrence: &accesslistv1.Recurrence{
+						Frequency:  0,
+						DayOfMonth: 0,
+					},
+					Notifications: &accesslistv1.Notifications{
+						Start: &durationpb.Duration{},
+					},
+				}
+			}),
+		},
+		{
+			name: "static-type and partial audit",
+			input: newAccessList(func(al *accesslistv1.AccessList) {
+				al.Spec.Type = string(accesslist.Static)
+				al.Spec.Audit = &accesslistv1.AccessListAudit{
+					NextAuditDate: &timestamppb.Timestamp{},
+					Recurrence: &accesslistv1.Recurrence{
+						Frequency:  0,
+						DayOfMonth: 4,
+					},
+					Notifications: &accesslistv1.Notifications{
+						Start: &durationpb.Duration{},
+					},
+				}
+			}),
 		},
 	}
 
@@ -423,7 +476,31 @@ func TestConvAccessList(t *testing.T) {
 			got := ToProto(acl)
 			require.NoError(t, err)
 
+			// See [Test_convertGrantsToProto_never_nil] why that is.
+			tt.input.Spec.Grants = stdcmp.Or(tt.input.Spec.Grants, &accesslistv1.AccessListGrants{})
+			tt.input.Spec.OwnerGrants = stdcmp.Or(tt.input.Spec.OwnerGrants, &accesslistv1.AccessListGrants{})
+
 			require.Equal(t, tt.input, got)
 		})
 	}
+}
+
+func Test_convertGrantsToProto_never_nil(t *testing.T) {
+	// We can't convert empty (owner) grants to nil because, when grants are
+	// not specified in Terraform, that causes it to error with:
+	//
+	// 	teleport_access_list.test_direct: Creating...
+	// 	╷
+	// 	│ Error: Provider produced inconsistent result after apply
+	// 	│
+	// 	│ When applying changes to teleport_access_list.test_direct, provider "provider[\"terraform.releases.teleport.dev/gravitational/teleport\"]" produced
+	// 	│ an unexpected new value: .spec.grants: was cty.ObjectVal(map[string]cty.Value{"roles":cty.ListValEmpty(cty.String),
+	// 	│ "traits":cty.ListValEmpty(cty.Object(map[string]cty.Type{"key":cty.String, "values":cty.List(cty.String)}))}), but now null.
+	// 	│
+	// 	│ This is a bug in the provider, which should be reported in the provider's own issue tracker.
+	// 	╵
+	//
+	// See https://github.com/gravitational/teleport/issues/58948
+	emptyGrants := accesslist.Grants{}
+	require.NotNil(t, convertGrantsToProto(emptyGrants))
 }

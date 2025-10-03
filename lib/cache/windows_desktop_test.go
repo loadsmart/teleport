@@ -27,8 +27,6 @@ import (
 
 	"github.com/gravitational/teleport/api/client/proto"
 	"github.com/gravitational/teleport/api/types"
-	"github.com/gravitational/teleport/api/utils/clientutils"
-	"github.com/gravitational/teleport/lib/itertools/stream"
 )
 
 // TestWindowsDesktops tests that CRUD operations on
@@ -51,27 +49,21 @@ func TestWindowsDesktop(t *testing.T) {
 			)
 		},
 		create: p.windowsDesktops.CreateWindowsDesktop,
-		list: func(ctx context.Context) ([]types.WindowsDesktop, error) {
-			var start string
+		list: func(ctx context.Context, pageSize int, pageToken string) ([]types.WindowsDesktop, string, error) {
 			var desktops []types.WindowsDesktop
-			for {
-				req := types.ListWindowsDesktopsRequest{
-					StartKey: start,
-				}
-
-				resp, err := p.windowsDesktops.ListWindowsDesktops(ctx, req)
-				if err != nil {
-					return nil, trace.Wrap(err)
-				}
-
-				desktops = append(desktops, resp.Desktops...)
-				start = resp.NextKey
-				if resp.NextKey == "" {
-					break
-				}
+			req := types.ListWindowsDesktopsRequest{
+				StartKey: pageToken,
+				Limit:    pageSize,
 			}
 
-			return desktops, nil
+			resp, err := p.windowsDesktops.ListWindowsDesktops(ctx, req)
+			if err != nil {
+				return nil, "", trace.Wrap(err)
+			}
+
+			desktops = append(desktops, resp.Desktops...)
+
+			return desktops, resp.NextKey, nil
 		},
 		cacheGet: func(ctx context.Context, s string) (types.WindowsDesktop, error) {
 			desktops, err := p.cache.GetWindowsDesktops(ctx, types.WindowsDesktopFilter{Name: s})
@@ -86,27 +78,20 @@ func TestWindowsDesktop(t *testing.T) {
 			return desktops[0], nil
 
 		},
-		cacheList: func(ctx context.Context) ([]types.WindowsDesktop, error) {
-			var start string
+		cacheList: func(ctx context.Context, pageSize int, pageToken string) ([]types.WindowsDesktop, string, error) {
 			var desktops []types.WindowsDesktop
-			for {
-				req := types.ListWindowsDesktopsRequest{
-					StartKey: start,
-				}
-
-				resp, err := p.cache.ListWindowsDesktops(ctx, req)
-				if err != nil {
-					return nil, trace.Wrap(err)
-				}
-
-				desktops = append(desktops, resp.Desktops...)
-				start = resp.NextKey
-				if resp.NextKey == "" {
-					break
-				}
+			req := types.ListWindowsDesktopsRequest{
+				StartKey: pageToken,
+				Limit:    pageSize,
 			}
 
-			return desktops, nil
+			resp, err := p.cache.ListWindowsDesktops(ctx, req)
+			if err != nil {
+				return nil, "", trace.Wrap(err)
+			}
+
+			desktops = append(desktops, resp.Desktops...)
+			return desktops, resp.NextKey, nil
 		},
 		update:    p.windowsDesktops.UpdateWindowsDesktop,
 		deleteAll: p.windowsDesktops.DeleteAllWindowsDesktops,
@@ -196,12 +181,12 @@ func TestWindowsDesktopService(t *testing.T) {
 				)
 			},
 			create:    withKeepalive(p.presenceS.UpsertWindowsDesktopService),
-			list:      p.presenceS.GetWindowsDesktopServices,
+			list:      getAllAdapter(p.presenceS.GetWindowsDesktopServices),
 			cacheGet:  p.cache.GetWindowsDesktopService,
-			cacheList: p.cache.GetWindowsDesktopServices,
+			cacheList: getAllAdapter(p.cache.GetWindowsDesktopServices),
 			update:    withKeepalive(p.presenceS.UpsertWindowsDesktopService),
 			deleteAll: p.presenceS.DeleteAllWindowsDesktopServices,
-		})
+		}, withSkipPaginationTest())
 	})
 
 	t.Run("ListResources", func(t *testing.T) {
@@ -218,54 +203,44 @@ func TestWindowsDesktopService(t *testing.T) {
 				)
 			},
 			create: withKeepalive(p.presenceS.UpsertWindowsDesktopService),
-			list: func(ctx context.Context) ([]types.WindowsDesktopService, error) {
+			list: func(ctx context.Context, pageSize int, pageToken string) ([]types.WindowsDesktopService, string, error) {
 				req := proto.ListResourcesRequest{
 					ResourceType: types.KindWindowsDesktopService,
+					StartKey:     pageToken,
+					Limit:        int32(pageSize),
 				}
 
 				var out []types.WindowsDesktopService
-				for {
-					resp, err := p.presenceS.ListResources(ctx, req)
-					if err != nil {
-						return nil, trace.Wrap(err)
-					}
-
-					for _, s := range resp.Resources {
-						out = append(out, s.(types.WindowsDesktopService))
-					}
-
-					req.StartKey = resp.NextKey
-					if req.StartKey == "" {
-						break
-					}
+				resp, err := p.presenceS.ListResources(ctx, req)
+				if err != nil {
+					return nil, "", trace.Wrap(err)
 				}
 
-				return out, nil
+				for _, s := range resp.Resources {
+					out = append(out, s.(types.WindowsDesktopService))
+				}
+
+				return out, resp.NextKey, nil
 			},
 			cacheGet: p.cache.GetWindowsDesktopService,
-			cacheList: func(ctx context.Context) ([]types.WindowsDesktopService, error) {
+			cacheList: func(ctx context.Context, pageSize int, pageToken string) ([]types.WindowsDesktopService, string, error) {
 				req := proto.ListResourcesRequest{
 					ResourceType: types.KindWindowsDesktopService,
+					Limit:        int32(pageSize),
+					StartKey:     pageToken,
 				}
 
 				var out []types.WindowsDesktopService
-				for {
-					resp, err := p.cache.ListResources(ctx, req)
-					if err != nil {
-						return nil, trace.Wrap(err)
-					}
-
-					for _, s := range resp.Resources {
-						out = append(out, s.(types.WindowsDesktopService))
-					}
-
-					req.StartKey = resp.NextKey
-					if req.StartKey == "" {
-						break
-					}
+				resp, err := p.cache.ListResources(ctx, req)
+				if err != nil {
+					return nil, "", trace.Wrap(err)
 				}
 
-				return out, nil
+				for _, s := range resp.Resources {
+					out = append(out, s.(types.WindowsDesktopService))
+				}
+
+				return out, resp.NextKey, nil
 			},
 			update:    withKeepalive(p.presenceS.UpsertWindowsDesktopService),
 			deleteAll: p.presenceS.DeleteAllWindowsDesktopServices,
@@ -292,13 +267,9 @@ func TestDynamicWindowsDesktop(t *testing.T) {
 			_, err := p.dynamicWindowsDesktops.CreateDynamicWindowsDesktop(ctx, dwd)
 			return err
 		},
-		list: func(ctx context.Context) ([]types.DynamicWindowsDesktop, error) {
-			return stream.Collect(clientutils.Resources(ctx, p.dynamicWindowsDesktops.ListDynamicWindowsDesktops))
-		},
-		cacheGet: p.cache.GetDynamicWindowsDesktop,
-		cacheList: func(ctx context.Context) ([]types.DynamicWindowsDesktop, error) {
-			return stream.Collect(clientutils.Resources(ctx, p.cache.ListDynamicWindowsDesktops))
-		},
+		list:      p.dynamicWindowsDesktops.ListDynamicWindowsDesktops,
+		cacheGet:  p.cache.GetDynamicWindowsDesktop,
+		cacheList: p.cache.ListDynamicWindowsDesktops,
 		update: func(ctx context.Context, dwd types.DynamicWindowsDesktop) error {
 			_, err := p.dynamicWindowsDesktops.UpdateDynamicWindowsDesktop(ctx, dwd)
 			return err

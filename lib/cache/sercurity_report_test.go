@@ -42,15 +42,15 @@ func TestAuditQuery(t *testing.T) {
 				err := p.secReports.UpsertSecurityAuditQuery(ctx, item)
 				return trace.Wrap(err)
 			},
-			list:      p.secReports.GetSecurityAuditQueries,
+			list:      getAllAdapter(p.secReports.GetSecurityAuditQueries),
 			cacheGet:  p.cache.GetSecurityAuditQuery,
-			cacheList: p.cache.GetSecurityAuditQueries,
+			cacheList: getAllAdapter(p.cache.GetSecurityAuditQueries),
 			update: func(ctx context.Context, item *secreports.AuditQuery) error {
 				err := p.secReports.UpsertSecurityAuditQuery(ctx, item)
 				return trace.Wrap(err)
 			},
 			deleteAll: p.secReports.DeleteAllSecurityAuditQueries,
-		})
+		}, withSkipPaginationTest())
 	})
 
 	t.Run("ListSecurityAuditQueries", func(t *testing.T) {
@@ -62,33 +62,15 @@ func TestAuditQuery(t *testing.T) {
 				err := p.secReports.UpsertSecurityAuditQuery(ctx, item)
 				return trace.Wrap(err)
 			},
-			list:     p.secReports.GetSecurityAuditQueries,
-			cacheGet: p.cache.GetSecurityAuditQuery,
-			cacheList: func(ctx context.Context) ([]*secreports.AuditQuery, error) {
-				var out []*secreports.AuditQuery
-				var startKey string
-
-				for {
-					resp, next, err := p.cache.ListSecurityAuditQueries(ctx, 0, startKey)
-					if err != nil {
-						return nil, trace.Wrap(err)
-					}
-
-					out = append(out, resp...)
-					startKey = next
-					if next == "" {
-						break
-					}
-				}
-
-				return out, nil
-			},
+			list:      getAllAdapter(p.secReports.GetSecurityAuditQueries),
+			cacheGet:  p.cache.GetSecurityAuditQuery,
+			cacheList: p.cache.ListSecurityAuditQueries,
 			update: func(ctx context.Context, item *secreports.AuditQuery) error {
 				err := p.secReports.UpsertSecurityAuditQuery(ctx, item)
 				return trace.Wrap(err)
 			},
 			deleteAll: p.secReports.DeleteAllSecurityAuditQueries,
-		})
+		}, withSkipPaginationTest())
 	})
 
 }
@@ -110,15 +92,15 @@ func TestSecurityReports(t *testing.T) {
 				err := p.secReports.UpsertSecurityReport(ctx, item)
 				return trace.Wrap(err)
 			},
-			list:      p.secReports.GetSecurityReports,
+			list:      getAllAdapter(p.secReports.GetSecurityReports),
 			cacheGet:  p.cache.GetSecurityReport,
-			cacheList: p.cache.GetSecurityReports,
+			cacheList: getAllAdapter(p.cache.GetSecurityReports),
 			update: func(ctx context.Context, item *secreports.Report) error {
 				err := p.secReports.UpsertSecurityReport(ctx, item)
 				return trace.Wrap(err)
 			},
 			deleteAll: p.secReports.DeleteAllSecurityReports,
-		})
+		}, withSkipPaginationTest())
 	})
 	t.Run("ListSecurityReports", func(t *testing.T) {
 		testResources(t, p, testFuncs[*secreports.Report]{
@@ -129,28 +111,9 @@ func TestSecurityReports(t *testing.T) {
 				err := p.secReports.UpsertSecurityReport(ctx, item)
 				return trace.Wrap(err)
 			},
-			list:     p.secReports.GetSecurityReports,
-			cacheGet: p.cache.GetSecurityReport,
-			cacheList: func(ctx context.Context) ([]*secreports.Report, error) {
-				var out []*secreports.Report
-				var startKey string
-
-				for {
-					resp, next, err := p.cache.ListSecurityReports(ctx, 0, startKey)
-					if err != nil {
-						return nil, trace.Wrap(err)
-					}
-
-					out = append(out, resp...)
-					startKey = next
-					if next == "" {
-						break
-					}
-				}
-
-				return out, nil
-
-			},
+			list:      p.secReports.ListSecurityReports,
+			cacheGet:  p.cache.GetSecurityReport,
+			cacheList: p.cache.ListSecurityReports,
 			update: func(ctx context.Context, item *secreports.Report) error {
 				err := p.secReports.UpsertSecurityReport(ctx, item)
 				return trace.Wrap(err)
@@ -177,50 +140,13 @@ func TestSecurityReportState(t *testing.T) {
 			err := p.secReports.UpsertSecurityReportsState(ctx, item)
 			return trace.Wrap(err)
 		},
-		list: func(ctx context.Context) ([]*secreports.ReportState, error) {
-			var out []*secreports.ReportState
-			var startKey string
-			for {
-				resp, next, err := p.secReports.ListSecurityReportsStates(ctx, 0, startKey)
-				if err != nil {
-					return nil, trace.Wrap(err)
-				}
-
-				out = append(out, resp...)
-
-				if next == "" {
-					break
-				}
-				startKey = next
-			}
-
-			return out, nil
-		},
-		cacheGet: p.cache.GetSecurityReportState,
-		cacheList: func(ctx context.Context) ([]*secreports.ReportState, error) {
-			var out []*secreports.ReportState
-			var startKey string
-			for {
-				resp, next, err := p.cache.ListSecurityReportsStates(ctx, 0, startKey)
-				if err != nil {
-					return nil, trace.Wrap(err)
-				}
-
-				out = append(out, resp...)
-
-				if next == "" {
-					break
-				}
-				startKey = next
-			}
-
-			return out, nil
-		},
+		list:      p.secReports.ListSecurityReportsStates,
+		cacheGet:  p.cache.GetSecurityReportState,
+		cacheList: p.cache.ListSecurityReportsStates,
 		update: func(ctx context.Context, item *secreports.ReportState) error {
 			err := p.secReports.UpsertSecurityReportsState(ctx, item)
 			return trace.Wrap(err)
 		},
 		deleteAll: p.secReports.DeleteAllSecurityReportsStates,
 	})
-
 }

@@ -40,7 +40,7 @@ import (
 	"github.com/gravitational/teleport/lib/auth/testauthority"
 	"github.com/gravitational/teleport/lib/client"
 	"github.com/gravitational/teleport/lib/service/servicecfg"
-	"github.com/gravitational/teleport/lib/utils"
+	"github.com/gravitational/teleport/lib/utils/log/logtest"
 	"github.com/gravitational/teleport/lib/utils/testutils"
 )
 
@@ -171,7 +171,7 @@ func testPortForwarding(t *testing.T, suite *integrationTestSuite) {
 				NodeName:    Host,
 				Priv:        privateKey,
 				Pub:         publicKey,
-				Logger:      utils.NewSlogLoggerForTests(),
+				Logger:      logtest.NewLogger(),
 			})
 
 			for _, login := range logins {
@@ -197,7 +197,7 @@ func testPortForwarding(t *testing.T, suite *integrationTestSuite) {
 				NodeName:    Host,
 				Priv:        privateKey,
 				Pub:         publicKey,
-				Logger:      utils.NewSlogLoggerForTests(),
+				Logger:      logtest.NewLogger(),
 			})
 
 			// Create node config.
@@ -280,11 +280,9 @@ func testPortForwarding(t *testing.T, suite *integrationTestSuite) {
 			cl.Stdin = term
 			cl.Labels = tt.labels
 
-			sshSessionCtx, sshSessionCancel := context.WithCancel(context.Background())
-			go cl.SSH(sshSessionCtx, []string{})
-			defer sshSessionCancel()
+			go cl.SSH(t.Context(), []string{})
 
-			timeout, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			timeout, cancel := context.WithTimeout(t.Context(), 15*time.Second)
 			defer cancel()
 			_, err = waitForSessionToBeEstablished(timeout, apidefaults.Namespace, site)
 			require.NoError(t, err)

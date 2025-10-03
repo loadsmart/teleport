@@ -51,7 +51,27 @@ export const traitsPreset = [
   'logins',
   'windows_logins',
   'github_orgs',
+  'mcp_tools',
+  'default_relay_addr',
 ] as const;
+
+export const traitDescriptions = {
+  aws_role_arns: 'List of allowed AWS role ARNS',
+  azure_identities: 'List of Azure identities',
+  db_names: 'List of allowed database names',
+  db_roles: 'List of allowed database roles',
+  db_users: 'List of allowed database users',
+  gcp_service_accounts: 'List of GCP service accounts',
+  kubernetes_groups: 'List of allowed Kubernetes groups',
+  kubernetes_users: 'List of allowed Kubernetes users',
+  logins: 'List of allowed logins',
+  windows_logins: 'List of allowed Windows logins',
+  host_user_gid: 'The group ID to use for auto-host-users',
+  host_user_uid: 'The user ID to use for auto-host-users',
+  github_orgs: 'List of allowed GitHub organizations for git command proxy',
+  mcp_tools: 'List of allowed MCP tools',
+  default_relay_addr: 'The relay address that clients should use by default',
+} as const satisfies { [key in (typeof traitsPreset)[number]]: string };
 
 /**
  * TraitsEditor supports add, edit or remove traits functionality.
@@ -67,6 +87,9 @@ export function TraitsEditor({
   setConfiguredTraits,
   tooltipContent,
   label = 'User Traits',
+  addActionLabel = 'Add a user trait',
+  addActionSubsequentLabel = 'Add another user trait',
+  autoFocus = true,
 }: TraitEditorProps) {
   function handleInputChange(i: InputOption | InputOptionArray) {
     const newTraits = [...configuredTraits];
@@ -109,7 +132,7 @@ export function TraitsEditor({
   }
 
   const addLabelText =
-    configuredTraits.length > 0 ? 'Add another user trait' : 'Add a user trait';
+    configuredTraits.length > 0 ? addActionSubsequentLabel : addActionLabel;
 
   return (
     <Fieldset>
@@ -147,12 +170,13 @@ export function TraitsEditor({
                     mb={0}
                     stylesConfig={customStyles}
                     data-testid="trait-key"
+                    ariaLabel="trait-key"
                     options={traitsPreset.map(r => ({
                       value: r,
                       label: r,
                     }))}
                     placeholder="Type a trait name and press enter"
-                    autoFocus
+                    autoFocus={autoFocus}
                     isSearchable
                     value={traitKey}
                     rule={requiredAll(
@@ -175,7 +199,7 @@ export function TraitsEditor({
                     size={inputSize}
                     mb={0}
                     stylesConfig={customStyles}
-                    data-testid="trait-value"
+                    data-testid="trait-values"
                     ariaLabel="trait-values"
                     placeholder="Type a trait value and press enter"
                     isMulti
@@ -282,6 +306,9 @@ export type TraitEditorProps = {
   isLoading: boolean;
   tooltipContent?: React.ReactNode;
   label?: string;
+  addActionLabel?: string;
+  addActionSubsequentLabel?: string;
+  autoFocus?: boolean;
 };
 
 export function traitsToTraitsOption(allTraits: AllUserTraits): TraitsOption[] {

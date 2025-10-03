@@ -41,17 +41,19 @@ import (
 	"github.com/gravitational/teleport/lib/services"
 	"github.com/gravitational/teleport/lib/tlsca"
 	"github.com/gravitational/teleport/lib/utils"
+	"github.com/gravitational/teleport/lib/utils/log/logtest"
 	"github.com/gravitational/teleport/lib/utils/mcputils"
 )
 
 func TestMain(m *testing.M) {
-	utils.InitLoggerForTests()
+	logtest.InitLogger(testing.Verbose)
 	os.Exit(m.Run())
 }
 
 type setupTestContextOptions struct {
-	roleSet services.RoleSet
-	app     types.Application
+	roleSet    services.RoleSet
+	app        types.Application
+	clientConn net.Conn
 }
 
 type setupTestContextOptionFunc func(*setupTestContextOptions)
@@ -68,21 +70,18 @@ func withRole(role types.Role) setupTestContextOptionFunc {
 	}
 }
 
+func withClientConn(conn net.Conn) setupTestContextOptionFunc {
+	return func(opts *setupTestContextOptions) {
+		opts.clientConn = conn
+	}
+}
+
 // withAdminRole assigns to ai_user a role that allows all MCP servers and their
 // tools.
 func withAdminRole(t *testing.T) setupTestContextOptionFunc {
 	t.Helper()
-	role, err := types.NewRole("admin", types.RoleSpecV6{
-		Allow: types.RoleConditions{
-			AppLabels: map[string]apiutils.Strings{
-				types.Wildcard: {types.Wildcard},
-			},
-			MCP: &types.MCPPermissions{
-				Tools: []string{types.Wildcard},
-			},
-		},
-	})
-	require.NoError(t, err)
+	role := services.NewPresetMCPUserRole()
+	require.NoError(t, services.CheckAndSetDefaults(role))
 	return withRole(role)
 }
 
@@ -147,8 +146,13 @@ func setupTestContext(t *testing.T, applyOpts ...setupTestContextOptionFunc) tes
 		applyOpt(&opts)
 	}
 
-	// Fake connection.
-	clientSourceConn, clientDestConn := makeDualPipeNetConn(t)
+	// Fake connection if not passed in.
+	var clientSourceConn, clientDestConn net.Conn
+	if opts.clientConn != nil {
+		clientDestConn = opts.clientConn
+	} else {
+		clientSourceConn, clientDestConn = makeDualPipeNetConn(t)
+	}
 
 	// App.
 	if opts.app == nil {
@@ -172,7 +176,7 @@ func setupTestContext(t *testing.T, applyOpts ...setupTestContextOptionFunc) tes
 	sessionCtx := &SessionCtx{
 		ClientConn: clientDestConn,
 		App:        opts.app,
-		AuthCtx:    makeTestAuthContext(t, opts.roleSet),
+		AuthCtx:    makeTestAuthContext(t, opts.roleSet, opts.app),
 	}
 	require.NoError(t, sessionCtx.checkAndSetDefaults())
 
@@ -182,7 +186,7 @@ func setupTestContext(t *testing.T, applyOpts ...setupTestContextOptionFunc) tes
 	}
 }
 
-func makeTestAuthContext(t *testing.T, roleSet services.RoleSet) *authz.Context {
+func makeTestAuthContext(t *testing.T, roleSet services.RoleSet, app types.Application) *authz.Context {
 	t.Helper()
 
 	user, err := types.NewUser("ai")
@@ -197,7 +201,12 @@ func makeTestAuthContext(t *testing.T, roleSet services.RoleSet) *authz.Context 
 			Principals: user.GetLogins(),
 		},
 	}
-	accessInfo, err := services.AccessInfoFromLocalTLSIdentity(identity.Identity, nil)
+	if app != nil {
+		identity.Identity.RouteToApp.Name = app.GetName()
+		identity.Identity.RouteToApp.SessionID = "session-id-for+" + app.GetName()
+	}
+
+	accessInfo, err := services.AccessInfoFromLocalTLSIdentity(identity.Identity)
 	require.NoError(t, err)
 	checker := services.NewAccessCheckerWithRoleSet(accessInfo, "my-cluster", roleSet)
 	return &authz.Context{
@@ -284,6 +293,12 @@ func checkToolsListResponse(t *testing.T, response mcp.JSONRPCMessage, wantID mc
 
 	var result mcp.ListToolsResult
 	require.NoError(t, json.Unmarshal(mcpResponse.Result, &result))
+	checkToolsListResult(t, &result, wantTools)
+}
+
+func checkToolsListResult(t *testing.T, result *mcp.ListToolsResult, wantTools []string) {
+	t.Helper()
+	require.NotNil(t, result)
 	var actualNames []string
 	for _, tool := range result.Tools {
 		actualNames = append(actualNames, tool.Name)
@@ -328,4 +343,11 @@ func forceRemoveContainer(t *testing.T, dockerClient *docker.Client, containerNa
 			t.Log("Failed to remove container", err)
 		}
 	}
+}
+
+type mockAuthClient struct {
+}
+
+func (m mockAuthClient) GenerateAppToken(_ context.Context, req types.GenerateAppTokenRequest) (string, error) {
+	return "app-token-for-" + req.Username, nil
 }

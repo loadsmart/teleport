@@ -1,6 +1,9 @@
 ---
 title: Installing Teleport on Docker
 description: How to install and run Teleport on Docker using our pre-built images from Amazon ECR Public, with details on configuration, data persistence, and networking.
+tags:
+- reference
+- platform-wide
 ---
 
 Docker provides a convenient way to deploy Teleport in containerized environments, offering consistent deployment across platforms and simplified dependency management. Teleport's pre-built Docker images are optimized for different use cases, from production deployments to development and troubleshooting scenarios. 
@@ -190,14 +193,14 @@ proxy_service:
     cert_file: /my/path/cert.pem
 ```
 
-See the Teleport [Configuration Reference](../reference/config.mdx) for whether a
+See the Teleport [Configuration Reference](../reference/deployment/config.mdx) for whether a
 field you would like to assign requires a file path.
 
 ### Ports
 
 A single Teleport process can run multiple services, each of which listens on a
 specific set of ports depending on your configuration. See our [Networking
-Reference](../reference/networking.mdx#ports) for the ports on your Teleport
+Reference](../reference/deployment/networking.mdx#ports) for the ports on your Teleport
 container to expose.
 
 ### Extracting certificates from distroless images

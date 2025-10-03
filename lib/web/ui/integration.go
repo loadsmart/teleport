@@ -68,6 +68,21 @@ type AWSRAProfileSync struct {
 
 	// RoleARN is the ARN of the IAM Role that is used to sync profiles.
 	RoleARN string `json:"roleArn"`
+
+	// ProfileNameFilters are the filters applied to the profiles.
+	// Only matching profiles will be synchronized as application servers.
+	// If empty, no filtering is applied.
+	//
+	// Filters can be globs, for example:
+	//
+	//	profile*
+	//	*name*
+	//
+	// Or regexes if they're prefixed and suffixed with ^ and $, for example:
+	//
+	//	^profile.*$
+	//	^.*name.*$
+	ProfileNameFilters []string `json:"filters"`
 }
 
 // CheckAndSetDefaults for the aws oidc integration spec.
@@ -109,6 +124,9 @@ type IntegrationWithSummary struct {
 	AWSRDS ResourceTypeSummary `json:"awsrds"`
 	// AWSEKS contains the summary for the AWS EKS resources for this integration.
 	AWSEKS ResourceTypeSummary `json:"awseks"`
+
+	// RolesAnywhereProfileSync contains the summary for the AWS Roles Anywhere Profile Sync.
+	RolesAnywhereProfileSync *RolesAnywhereProfileSync `json:"rolesAnywhereProfileSync,omitempty"`
 }
 
 // ResourceTypeSummary contains the summary of the enrollment rules and found resources by the integration.
@@ -133,6 +151,26 @@ type ResourceTypeSummary struct {
 	// ECSDatabaseServiceCount is the total number of DatabaseServices that were deployed into Amazon ECS.
 	// Only applicable for AWS RDS resource summary.
 	ECSDatabaseServiceCount int `json:"ecsDatabaseServiceCount,omitempty"`
+}
+
+// RolesAnywhereProfileSync contains the summary for the AWS Roles Anywhere Profile Sync.
+type RolesAnywhereProfileSync struct {
+	// Enabled indicates whether the profile sync is enabled.
+	Enabled bool `json:"enabled"`
+
+	// Status is the string representation of the profile sync status.
+	// Either ERROR or SUCCESS.
+	Status string `json:"status,omitempty"`
+	// ErrorMessage is the error message from the last sync when the Status is ERROR.
+	ErrorMessage string `json:"errorMessage,omitempty"`
+
+	// SyncedProfiles is the number of profiles that were imported into Teleport.
+	SyncedProfiles int `json:"syncedProfiles,omitempty"`
+
+	// SyncStartTime is the time when the profile sync started.
+	SyncStartTime time.Time `json:"syncStartTime,omitempty"`
+	// SyncEndTime is the time when the profile sync ended.
+	SyncEndTime time.Time `json:"syncEndTime,omitempty"`
 }
 
 // IntegrationDiscoveryRule describes a discovery rule associated with an integration.
@@ -355,9 +393,10 @@ func MakeIntegration(ig types.Integration) (*Integration, error) {
 		ret.AWSRA = &IntegrationAWSRASpec{
 			TrustAnchorARN: spec.TrustAnchorARN,
 			ProfileSyncConfig: AWSRAProfileSync{
-				Enabled:    spec.ProfileSyncConfig.Enabled,
-				ProfileARN: spec.ProfileSyncConfig.ProfileARN,
-				RoleARN:    spec.ProfileSyncConfig.RoleARN,
+				Enabled:            spec.ProfileSyncConfig.Enabled,
+				ProfileARN:         spec.ProfileSyncConfig.ProfileARN,
+				RoleARN:            spec.ProfileSyncConfig.RoleARN,
+				ProfileNameFilters: spec.ProfileSyncConfig.ProfileNameFilters,
 			},
 		}
 	}
@@ -668,4 +707,46 @@ type AWSOIDCPingRequest struct {
 type AWSOIDCCreateAWSAppAccessRequest struct {
 	// Labels added to the app server resource that will be created.
 	Labels map[string]string `json:"labels"`
+}
+
+// AWSRolesAnywherePingRequest contains ping request fields.
+type AWSRolesAnywherePingRequest struct {
+	// TrustAnchorARN is the ARN of the IAM Roles Anywhere Trust Anchor.
+	TrustAnchorARN string `json:"trustAnchorArn"`
+	// SyncProfileARN is the ARN of the IAM Roles Anywhere Profile that is used to sync profiles.
+	SyncProfileARN string `json:"syncProfileArn"`
+	// SyncRoleARN is the ARN of the IAM Role that is used to sync profiles.
+	SyncRoleARN string `json:"syncRoleArn"`
+}
+
+// AWSRolesAnywherePingResponse contains the result of the Ping request.
+// This response contains meta information about the current state of the Integration.
+type AWSRolesAnywherePingResponse struct {
+	// ProfileCount is the number of IAM Roles Anywhere Profiles that can be accessed by the Integration.
+	// Profiles that are disabled or don't have any IAM Role associated with them are not counted.
+	ProfileCount int `json:"profileCount"`
+	// AccountID number of the account that owns or contains the calling entity.
+	AccountID string `json:"accountId"`
+	// ARN associated with the calling entity.
+	ARN string `json:"arn"`
+	// UserID is the unique identifier of the calling entity.
+	UserID string `json:"userId"`
+}
+
+// AWSRolesAnywhereListProfilesRequest contains the request to list Roles Anywhere Profiles.
+type AWSRolesAnywhereListProfilesRequest struct {
+	// Filters are the filters applied to the profiles.
+	// Only matching profiles will be synchronized as application servers.
+	// If empty, no filtering is applied.
+	//
+	// Filters can be globs, for example:
+	//
+	//	profile*
+	//	*name*
+	//
+	// Or regexes if they're prefixed and suffixed with ^ and $, for example:
+	//
+	//	^profile.*$
+	//	^.*name.*$
+	Filters []string `json:"filters"`
 }

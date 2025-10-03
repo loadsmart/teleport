@@ -20,15 +20,13 @@ package mcp
 
 import (
 	"context"
-	"io"
-	"log/slog"
 	"os"
 	"path"
 	"testing"
 	"time"
 
 	"github.com/gravitational/trace"
-	mcpserver "github.com/mark3labs/mcp-go/server"
+	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -36,8 +34,8 @@ import (
 	apievents "github.com/gravitational/teleport/api/types/events"
 	"github.com/gravitational/teleport/lib/events"
 	"github.com/gravitational/teleport/lib/events/eventstest"
+	"github.com/gravitational/teleport/lib/utils"
 	"github.com/gravitational/teleport/lib/utils/mcptest"
-	"github.com/gravitational/teleport/lib/utils/mcputils"
 )
 
 func Test_handleAuthErrStdio(t *testing.T) {
@@ -47,22 +45,24 @@ func Test_handleAuthErrStdio(t *testing.T) {
 		ParentContext: ctx,
 		HostID:        "my-host-id",
 		AccessPoint:   fakeAccessPoint{},
+		CipherSuites:  utils.DefaultCipherSuites(),
+		AuthClient:    mockAuthClient{},
 	})
 	require.NoError(t, err)
 
-	clientSourceConn, clientDestConn := makeDualPipeNetConn(t)
+	testCtx := setupTestContext(t, withAdminRole(t))
 
 	originalAuthErr := trace.AccessDenied("test access denied")
 	handlerDoneCh := make(chan struct{}, 1)
 	go func() {
-		handlerErr := s.HandleUnauthorizedConnection(ctx, clientDestConn, originalAuthErr)
+		handlerErr := s.HandleUnauthorizedConnection(ctx, testCtx.SessionCtx.ClientConn, testCtx.SessionCtx.App, originalAuthErr)
 		handlerDoneCh <- struct{}{}
 		require.ErrorIs(t, handlerErr, originalAuthErr)
 	}()
 
-	stdioClient := mcptest.NewStdioClientFromConn(t, clientSourceConn)
+	stdioClient := mcptest.NewStdioClientFromConn(t, testCtx.clientSourceConn)
 	_, err = mcptest.InitializeClient(ctx, stdioClient)
-	require.EqualError(t, err, originalAuthErr.Error())
+	require.ErrorContains(t, err, originalAuthErr.Error())
 
 	select {
 	case <-time.After(time.Second * 10):
@@ -80,30 +80,48 @@ func Test_handleStdio(t *testing.T) {
 		ParentContext: ctx,
 		HostID:        "my-host-id",
 		AccessPoint:   fakeAccessPoint{},
+		CipherSuites:  utils.DefaultCipherSuites(),
+		AuthClient:    mockAuthClient{},
 	})
 	require.NoError(t, err)
 
 	handlerDoneCh := make(chan struct{}, 1)
 	defer close(handlerDoneCh)
 	go func() {
-		// Use mock server.
-		handlerErr := s.handleStdio(ctx, *testCtx.SessionCtx, makeMockMCPServerRunner)
+		// Use the demo server.
+		handlerErr := s.handleStdio(ctx, testCtx.SessionCtx, makeDemoServerRunner)
 		handlerDoneCh <- struct{}{}
 		require.NoError(t, handlerErr)
 	}()
 
 	// Use a real client. Verify session start and end events.
 	stdioClient := mcptest.NewStdioClientFromConn(t, testCtx.clientSourceConn)
-	require.EventuallyWithT(t, func(collect *assert.CollectT) {
+	require.EventuallyWithT(t, func(t *assert.CollectT) {
 		event := emitter.LastEvent()
 		_, ok := event.(*apievents.MCPSessionStart)
-		assert.True(collect, ok)
+		require.True(t, ok)
 	}, time.Second*5, time.Millisecond*100, "expect session start")
+
+	// Some basic tests on the demo server.
 	resp, err := mcptest.InitializeClient(ctx, stdioClient)
 	require.NoError(t, err)
-	require.Equal(t, "test-server", resp.ServerInfo.Name)
+	require.Equal(t, "teleport-demo", resp.ServerInfo.Name)
 
-	mcptest.MustCallServerTool(t, ctx, stdioClient)
+	listToolsResult, err := stdioClient.ListTools(ctx, mcp.ListToolsRequest{})
+	require.NoError(t, err)
+	checkToolsListResult(t, listToolsResult, []string{
+		"teleport_user_info",
+		"teleport_session_info",
+		"teleport_demo_info",
+	})
+
+	callToolResult, err := stdioClient.CallTool(ctx, mcp.CallToolRequest{
+		Params: mcp.CallToolParams{
+			Name: "teleport_user_info",
+		},
+	})
+	require.NoError(t, err)
+	require.Len(t, callToolResult.Content, 1)
 
 	// Now close the client.
 	stdioClient.Close()
@@ -115,52 +133,6 @@ func Test_handleStdio(t *testing.T) {
 	event := emitter.LastEvent()
 	_, ok := event.(*apievents.MCPSessionEnd)
 	require.True(t, ok)
-}
-
-func makeMockMCPServerRunner(context.Context, *sessionHandler) (stdioServerRunner, error) {
-	serverStdin, writeToServer := io.Pipe()
-	readFromServer, serverStdout := io.Pipe()
-	return &mockStdioServerRunner{
-		serverStdin:    serverStdin,
-		serverStdout:   serverStdout,
-		writeToServer:  writeToServer,
-		readFromServer: readFromServer,
-		pipeClosers: []io.Closer{
-			serverStdin, writeToServer,
-			readFromServer, serverStdout,
-		},
-	}, nil
-}
-
-type mockStdioServerRunner struct {
-	serverStdin    io.ReadCloser
-	serverStdout   io.WriteCloser
-	writeToServer  io.WriteCloser
-	readFromServer io.ReadCloser
-	pipeClosers    []io.Closer
-}
-
-func (s *mockStdioServerRunner) getStdinPipe() (io.WriteCloser, error) {
-	return s.writeToServer, nil
-}
-
-func (s *mockStdioServerRunner) getStdoutPipe() (io.ReadCloser, error) {
-	return s.readFromServer, nil
-}
-
-func (s *mockStdioServerRunner) run(ctx context.Context) error {
-	slog.DebugContext(ctx, "running mock stdio server")
-	err := mcpserver.NewStdioServer(mcptest.NewServer()).Listen(ctx, s.serverStdin, s.serverStdout)
-	if err != nil && !mcputils.IsOKCloseError(err) {
-		return trace.Wrap(err)
-	}
-	return nil
-}
-
-func (s *mockStdioServerRunner) close() {
-	for _, pipeCloser := range s.pipeClosers {
-		pipeCloser.Close()
-	}
 }
 
 // TestHandleSession_execMCPServer tests real server handler for stdio-based MCP
@@ -183,6 +155,8 @@ func TestHandleSession_execMCPServer(t *testing.T) {
 		ParentContext: t.Context(),
 		HostID:        "my-host-id",
 		AccessPoint:   fakeAccessPoint{},
+		CipherSuites:  utils.DefaultCipherSuites(),
+		AuthClient:    mockAuthClient{},
 	})
 	require.NoError(t, err)
 
@@ -310,7 +284,7 @@ func TestHandleSession_execMCPServer(t *testing.T) {
 			handlerDoneCh := make(chan struct{}, 1)
 			defer close(handlerDoneCh)
 			go func() {
-				handlerErr := s.HandleSession(handlerCtx, *testCtx.SessionCtx)
+				handlerErr := s.HandleSession(handlerCtx, testCtx.SessionCtx)
 				handlerDoneCh <- struct{}{}
 				tt.checkHandlerError(t, handlerErr)
 			}()

@@ -50,7 +50,7 @@ import (
 	"github.com/gravitational/teleport/lib/kube/proxy/responsewriters"
 	"github.com/gravitational/teleport/lib/srv/alpnproxy/common"
 	"github.com/gravitational/teleport/lib/tlsca"
-	"github.com/gravitational/teleport/lib/utils"
+	"github.com/gravitational/teleport/lib/utils/log/logtest"
 )
 
 // TestHandleAWSAccessSigVerification tests if LocalProxy verifies the AWS SigV4 signature of incoming request.
@@ -540,16 +540,14 @@ func TestKubeMiddleware(t *testing.T) {
 			km.HandleRequest(rw, req)
 
 			// request timed out.
-			assert.Equal(t, http.StatusInternalServerError, rw.Status())
-			assert.Contains(t, rw.Buffer().String(), "context canceled")
+			require.Equal(t, http.StatusInternalServerError, rw.Status())
+			require.Contains(t, rw.Buffer().String(), "context canceled")
 
 			// but certificate still was reissued.
 			certs, err := km.OverwriteClientCerts(req)
-			assert.NoError(t, err)
-			if !assert.Len(t, certs, 1) {
-				return
-			}
-			assert.Equal(t, newCert, certs[0], "certificate was not reissued")
+			require.NoError(t, err)
+			require.Len(t, certs, 1)
+			require.Equal(t, newCert, certs[0], "certificate was not reissued")
 
 		}, 15*time.Second, 100*time.Millisecond)
 	})
@@ -612,7 +610,7 @@ func TestKubeMiddleware(t *testing.T) {
 			km := NewKubeMiddleware(KubeMiddlewareConfig{
 				Certs:        tt.startCerts,
 				CertReissuer: certReissuer,
-				Logger:       utils.NewSlogLoggerForTests(),
+				Logger:       logtest.NewLogger(),
 				Clock:        tt.clock,
 				CloseContext: context.Background(),
 			})

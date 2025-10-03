@@ -40,6 +40,7 @@ import (
 	"github.com/gravitational/teleport/api/types/autoupdate"
 	"github.com/gravitational/teleport/lib/client"
 	"github.com/gravitational/teleport/lib/modules"
+	"github.com/gravitational/teleport/lib/modules/modulestest"
 )
 
 func TestPing(t *testing.T) {
@@ -216,7 +217,7 @@ func TestPing(t *testing.T) {
 			if buildType == "" {
 				buildType = modules.BuildOSS
 			}
-			modules.SetTestModules(t, &modules.TestModules{
+			modulestest.SetTestModules(t, modulestest.Modules{
 				TestBuildType: buildType,
 			})
 
@@ -253,9 +254,9 @@ func TestPing_multiProxyAddr(t *testing.T) {
 
 // TestPing_minimalAPI tests that pinging the minimal web API works correctly.
 func TestPing_minimalAPI(t *testing.T) {
-	env := newWebPack(t, 1, func(cfg *proxyConfig) {
+	env := newWebPack(t, 1, withWebPackProxyOptions(func(cfg *proxyConfig) {
 		cfg.minimalHandler = true
-	})
+	}))
 	proxy := env.proxies[0]
 	tests := []struct {
 		name string

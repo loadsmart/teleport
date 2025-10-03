@@ -39,6 +39,7 @@ import (
 	"github.com/gravitational/teleport/lib/auth/authclient"
 	"github.com/gravitational/teleport/lib/service/servicecfg"
 	"github.com/gravitational/teleport/lib/utils"
+	"github.com/gravitational/teleport/lib/utils/log/logtest"
 	tctlcfg "github.com/gravitational/teleport/tool/tctl/common/config"
 	"github.com/gravitational/teleport/tool/teleport/testenv"
 )
@@ -47,12 +48,19 @@ import (
 // enabling/disabling auto update, setting the target version and retrieve it.
 func TestClientToolsAutoUpdateCommands(t *testing.T) {
 	ctx := context.Background()
-	log := utils.NewSlogLoggerForTests()
-	process := testenv.MakeTestServer(t, testenv.WithLogger(log))
-	authClient := testenv.MakeDefaultAuthClient(t, process)
+	log := logtest.NewLogger()
+	process, err := testenv.NewTeleportProcess(t.TempDir(), testenv.WithLogger(log))
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		require.NoError(t, process.Close())
+		require.NoError(t, process.Wait())
+	})
+	authClient, err := testenv.NewDefaultAuthClient(process)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = authClient.Close() })
 
 	// Check that AutoUpdateConfig and AutoUpdateVersion are not created.
-	_, err := authClient.GetAutoUpdateConfig(ctx)
+	_, err = authClient.GetAutoUpdateConfig(ctx)
 	require.True(t, trace.IsNotFound(err))
 	_, err = authClient.GetAutoUpdateVersion(ctx)
 	require.True(t, trace.IsNotFound(err))

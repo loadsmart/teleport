@@ -98,8 +98,8 @@ import (
 	"github.com/gravitational/teleport/lib/sshutils/sftp"
 	"github.com/gravitational/teleport/lib/tlsca"
 	"github.com/gravitational/teleport/lib/utils"
-	"github.com/gravitational/teleport/lib/utils/agentconn"
 	logutils "github.com/gravitational/teleport/lib/utils/log"
+	"github.com/gravitational/teleport/lib/utils/set"
 )
 
 const (
@@ -195,6 +195,10 @@ type Config struct {
 	// (for example, using command-line flags).
 	ExplicitUsername bool
 
+	// Scope is the target scope, used during authentication/login to request certificates
+	// that are limited (pinned) to a given target scope.
+	Scope string
+
 	// Remote host to connect
 	Host string
 
@@ -239,6 +243,18 @@ type Config struct {
 
 	// MySQLProxyAddr is the host:port the MySQL proxy can be accessed at.
 	MySQLProxyAddr string
+
+	// RelayAddr is the user-specified address of the relay in use.
+	RelayAddr string
+
+	// ProfileRelayAddr is the relay address specified at login time, or "none"
+	// if use of a relay is explicitly disabled.
+	ProfileRelayAddr string
+
+	// ProfileDefaultRelayAddr is the cluster-specified address of the relay, to
+	// be used if no explicit override is specified by the user. Set at login
+	// time.
+	ProfileDefaultRelayAddr string
 
 	// KeyTTL is a time to live for the temporary SSH keypair to remain valid:
 	KeyTTL time.Duration
@@ -746,7 +762,7 @@ func RetryWithRelogin(ctx context.Context, tc *TeleportClient, fn func() error, 
 		return trace.Wrap(err)
 	}
 
-	// Save profile to record proxy credentials
+	// Save profile to record proxy credentials.
 	if err := tc.SaveProfile(opt.makeCurrentProfile); err != nil {
 		log.WarnContext(ctx, "Failed to save profile", "error", err)
 		return trace.Wrap(err)
@@ -929,6 +945,8 @@ func (c *Config) LoadProfile(proxyAddr string) error {
 	c.PostgresProxyAddr = profile.PostgresProxyAddr
 	c.MySQLProxyAddr = profile.MySQLProxyAddr
 	c.MongoProxyAddr = profile.MongoProxyAddr
+	c.ProfileRelayAddr = profile.RelayAddr
+	c.ProfileDefaultRelayAddr = profile.DefaultRelayAddr
 	c.TLSRoutingEnabled = profile.TLSRoutingEnabled
 	c.TLSRoutingConnUpgradeRequired = profile.TLSRoutingConnUpgradeRequired
 	c.AuthConnector = profile.AuthConnector
@@ -957,6 +975,16 @@ func (c *Config) LoadProfile(proxyAddr string) error {
 		"web_proxy_addr", c.WebProxyAddr,
 		"upgrade_required", c.TLSRoutingConnUpgradeRequired,
 	)
+
+	switch profile.RelayAddr {
+	case "":
+		c.RelayAddr = profile.DefaultRelayAddr
+	case "none":
+		c.RelayAddr = ""
+	default:
+		c.RelayAddr = profile.RelayAddr
+	}
+
 	return nil
 }
 
@@ -983,6 +1011,8 @@ func (c *Config) Profile() *profile.Profile {
 		PostgresProxyAddr:             c.PostgresProxyAddr,
 		MySQLProxyAddr:                c.MySQLProxyAddr,
 		MongoProxyAddr:                c.MongoProxyAddr,
+		RelayAddr:                     c.ProfileRelayAddr,
+		DefaultRelayAddr:              c.ProfileDefaultRelayAddr,
 		SiteName:                      c.SiteName,
 		TLSRoutingEnabled:             c.TLSRoutingEnabled,
 		TLSRoutingConnUpgradeRequired: c.TLSRoutingConnUpgradeRequired,
@@ -1259,10 +1289,6 @@ type TeleportClient struct {
 	statusMu   sync.Mutex
 
 	localAgent *LocalKeyAgent
-
-	// OnChannelRequest gets called when SSH channel requests are
-	// received. It's safe to keep it nil.
-	OnChannelRequest tracessh.ChannelRequestCallback
 
 	// OnShellCreated gets called when the shell is created. It's
 	// safe to keep it nil.
@@ -2259,7 +2285,7 @@ func (tc *TeleportClient) runShellOrCommandOnSingleNode(ctx context.Context, clt
 		// Reuse the existing nodeClient we connected above.
 		return nodeClient.RunCommand(ctx, command)
 	}
-	return trace.Wrap(nodeClient.RunInteractiveShell(ctx, types.SessionPeerMode, nil, tc.OnChannelRequest, nil))
+	return trace.Wrap(nodeClient.RunInteractiveShell(ctx, types.SessionPeerMode, nil, nil))
 }
 
 func (tc *TeleportClient) runShellOrCommandOnMultipleNodes(ctx context.Context, clt *ClusterClient, nodes []TargetNode, command []string) error {
@@ -2413,7 +2439,7 @@ func (tc *TeleportClient) Join(ctx context.Context, mode types.SessionParticipan
 	}
 
 	// running shell with a given session means "join" it:
-	err = nc.RunInteractiveShell(ctx, mode, session, tc.OnChannelRequest, beforeStart)
+	err = nc.RunInteractiveShell(ctx, mode, session, beforeStart)
 	return trace.Wrap(err)
 }
 
@@ -2551,6 +2577,10 @@ func playSession(ctx context.Context, sessionID string, speed float64, streamer 
 		default:
 			continue
 		}
+	}
+
+	if err := player.Err(); err != nil {
+		return trace.Wrap(err)
 	}
 
 	return nil
@@ -3172,6 +3202,7 @@ func (tc *TeleportClient) ConnectToCluster(ctx context.Context) (_ *ClusterClien
 
 	pclt, err := proxyclient.NewClient(ctx, proxyclient.ClientConfig{
 		ProxyAddress:      cfg.proxyAddress,
+		RelayAddress:      tc.RelayAddr,
 		TLSRoutingEnabled: tc.TLSRoutingEnabled,
 		TLSConfigFunc: func(cluster string) (*tls.Config, error) {
 			if cluster == "" {
@@ -3880,7 +3911,7 @@ func (tc *TeleportClient) directLoginWeb(ctx context.Context, secondFactorType c
 	}
 
 	// authenticate via the web api
-	clt, session, err := SSHAgentLoginWeb(ctx, SSHLoginDirect{
+	clt, session, err := sshAgentLoginWeb(ctx, SSHLoginDirect{
 		SSHLogin: sshLogin,
 		User:     tc.Username,
 		Password: password,
@@ -3901,7 +3932,7 @@ func (tc *TeleportClient) mfaLocalLoginWeb(ctx context.Context, keyRing *KeyRing
 		return nil, nil, trace.Wrap(err)
 	}
 
-	clt, session, err := SSHAgentMFAWebSessionLogin(ctx, SSHLoginMFA{
+	clt, session, err := sshAgentMFAWebSessionLogin(ctx, SSHLoginMFA{
 		SSHLogin:             sshLogin,
 		User:                 tc.Username,
 		Password:             password,
@@ -3990,6 +4021,24 @@ func (tc *TeleportClient) SSHLogin(ctx context.Context, sshLoginFunc SSHLoginFun
 		rootClusterName := keyRing.TrustedCerts[0].ClusterName
 		keyRing.KeyRingIndex.ClusterName = rootClusterName
 		tc.SiteName = rootClusterName
+	}
+
+	// update the default relay addr from the latest response, which will later
+	// be persisted in the profile
+	tc.ProfileDefaultRelayAddr = response.ClientOptions.DefaultRelayAddr
+
+	tlsCert, err := tlsca.ParseCertificatePEM(response.TLSCert)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	ident, err := tlsca.FromSubject(tlsCert.Subject, time.Time{})
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	if ident.ScopePin != nil {
+		log.DebugContext(ctx, "got scoped certificate identity", "scope", ident.ScopePin.Scope, "assignments", ident.ScopePin.Assignments)
 	}
 
 	return keyRing, nil
@@ -4115,6 +4164,7 @@ func (tc *TeleportClient) NewSSHLogin(keyRing *KeyRing) (SSHLogin, error) {
 		TTL:                     tc.KeyTTL,
 		Insecure:                tc.InsecureSkipVerify,
 		Pool:                    loopbackPool(tc.WebProxyAddr),
+		Scope:                   tc.Scope,
 		Compatibility:           tc.CertificateFormat,
 		RouteToCluster:          tc.SiteName,
 		KubernetesCluster:       tc.KubernetesCluster,
@@ -4911,25 +4961,6 @@ func loopbackPool(proxyAddr string) *x509.CertPool {
 	return certPool
 }
 
-// connectToSSHAgent connects to the system SSH agent and returns an agent.Agent.
-func connectToSSHAgent() agent.ExtendedAgent {
-	ctx := context.Background()
-	logger := log.With(teleport.ComponentKey, teleport.ComponentKeyAgent)
-
-	socketPath := os.Getenv(teleport.SSHAuthSock)
-	conn, err := agentconn.Dial(socketPath)
-	if err != nil {
-		logger.WarnContext(ctx, "Unable to connect to SSH agent on socket",
-			"socket_path", socketPath,
-			"error", err,
-		)
-		return nil
-	}
-
-	logger.InfoContext(ctx, "Connected to the system agent", "socket_path", socketPath)
-	return agent.NewClient(conn)
-}
-
 // Username returns the current user's username
 func Username() (string, error) {
 	u, err := user.Current()
@@ -5551,6 +5582,12 @@ func (tc *TeleportClient) DialMCPServer(ctx context.Context, appName string) (ne
 		return nil, trace.BadParameter("app %q is not a MCP server", appName)
 	}
 
+	// TODO(greedy52) support streamable HTTP for "tsh mcp connect" before
+	// release.
+	if transport := types.GetMCPServerTransportType(apps[0].GetURI()); transport == types.MCPTransportHTTP {
+		return nil, trace.NotImplemented("MCP support for %s is not yet implemented", transport)
+	}
+
 	cert, err := tc.issueMCPCertWithMFA(ctx, apps[0])
 	if err != nil {
 		return nil, trace.Wrap(err)
@@ -5623,4 +5660,24 @@ func (tc *TeleportClient) DialDatabase(ctx context.Context, route proto.RouteToD
 	}
 
 	return tc.DialALPN(ctx, cert, alpnProtocol)
+}
+
+// CalculateSSHLogins returns the subset of the allowedLogins that exist in
+// the principals of the identity. This is required because SSH authorization
+// only allows using a login that exists in the certificates valid principals.
+// When connecting to servers in a leaf cluster, the root certificate is used,
+// so we need to ensure that we only present the allowed logins that would
+// result in a successful connection, if any exists.
+func CalculateSSHLogins(identityPrincipals []string, allowedLogins []string) ([]string, error) {
+	allowed := set.New(allowedLogins...)
+
+	var logins []string
+	for _, local := range identityPrincipals {
+		if allowed.Contains(local) {
+			logins = append(logins, local)
+		}
+	}
+
+	slices.Sort(logins)
+	return logins, nil
 }

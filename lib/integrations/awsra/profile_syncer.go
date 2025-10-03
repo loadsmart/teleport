@@ -30,19 +30,22 @@ import (
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/rolesanywhere"
-	ratypes "github.com/aws/aws-sdk-go-v2/service/rolesanywhere/types"
 	"github.com/google/uuid"
 	"github.com/gravitational/trace"
 	"github.com/jonboulle/clockwork"
 
 	"github.com/gravitational/teleport/api/constants"
+	"github.com/gravitational/teleport/api/defaults"
+	integrationv1 "github.com/gravitational/teleport/api/gen/proto/go/teleport/integration/v1"
 	"github.com/gravitational/teleport/api/types"
+	"github.com/gravitational/teleport/api/utils/retryutils"
+	"github.com/gravitational/teleport/lib/backend"
 	"github.com/gravitational/teleport/lib/integrations/awsra/createsession"
 	"github.com/gravitational/teleport/lib/utils"
 )
 
-// AWSRolesAnywherProfileSyncerParams contains the parameters for the AWS Roles Anywhere Profile Syncer.
-type AWSRolesAnywherProfileSyncerParams struct {
+// AWSRolesAnywhereProfileSyncerParams contains the parameters for the AWS Roles Anywhere Profile Syncer.
+type AWSRolesAnywhereProfileSyncerParams struct {
 	// Clock is used to calculate the expiration time of the AppServers.
 	Clock clockwork.Clock
 
@@ -54,6 +57,12 @@ type AWSRolesAnywherProfileSyncerParams struct {
 
 	// Cache is used to get the current cluster name and cert authority keys.
 	Cache SyncerCache
+
+	// Backend is used access the lock primitives to ensure only one Syncer is running at any given time.
+	Backend backend.Backend
+
+	// StatusReporter is used to report the status of the syncer.
+	StatusReporter StatusReporter
 
 	// AppServerUpserter is used to upsert AppServers.
 	AppServerUpserter AppServerUpserter
@@ -77,6 +86,12 @@ type AWSRolesAnywherProfileSyncerParams struct {
 	createSession func(ctx context.Context, req createsession.CreateSessionRequest) (*createsession.CreateSessionResponse, error)
 }
 
+// StatusReporter is an interface that defines methods for reporting the status of the syncer.
+type StatusReporter interface {
+	// UpdateIntegration updates the current integration status.
+	UpdateIntegration(ctx context.Context, req types.Integration) (types.Integration, error)
+}
+
 // SyncerCache is the subset of the cached resources that the syncer service queries.
 type SyncerCache interface {
 	// GetCertAuthority returns cert authority by id
@@ -98,7 +113,7 @@ type RolesAnywhereClient interface {
 	ListTagsForResource(ctx context.Context, params *rolesanywhere.ListTagsForResourceInput, optFns ...func(*rolesanywhere.Options)) (*rolesanywhere.ListTagsForResourceOutput, error)
 }
 
-func (p *AWSRolesAnywherProfileSyncerParams) checkAndSetDefaults() error {
+func (p *AWSRolesAnywhereProfileSyncerParams) checkAndSetDefaults() error {
 	if p.KeyStoreManager == nil {
 		return trace.BadParameter("key store manager is required")
 	}
@@ -107,8 +122,16 @@ func (p *AWSRolesAnywherProfileSyncerParams) checkAndSetDefaults() error {
 		return trace.BadParameter("cache client is required")
 	}
 
+	if p.StatusReporter == nil {
+		return trace.BadParameter("status reporter is required")
+	}
+
 	if p.AppServerUpserter == nil {
 		return trace.BadParameter("app server upserter is required")
+	}
+
+	if p.Backend == nil {
+		return trace.BadParameter("backend is required")
 	}
 
 	if p.SyncPollInterval == 0 {
@@ -138,7 +161,7 @@ type AppServerUpserter interface {
 	UpsertApplicationServer(ctx context.Context, server types.AppServer) (*types.KeepAlive, error)
 }
 
-// RunAWSRolesAnywherProfileSyncer starts the AWS Roles Anywhere Profile Syncer.
+// RunAWSRolesAnywhereProfileSyncerWhileLocked runs the AWS Roles Anywhere Profile Syncer.
 // It will iterate over all AWS IAM Roles Anywhere integrations, and for each one:
 // 1. Check if the Profile Sync is enabled.
 // 2. Generate AWS credentials using the integration.
@@ -146,35 +169,135 @@ type AppServerUpserter interface {
 // 4. For each profile, check if it is enabled and has associated roles.
 // 5. Create an AppServer for each profile, using the profile name as the AppServer name.
 // AppServer name can be overridden by the `TeleportApplicationName` tag on the Profile.
-func RunAWSRolesAnywherProfileSyncer(ctx context.Context, params AWSRolesAnywherProfileSyncerParams) error {
+//
+// This function will run the AWS Roles Anywhere Profile Syncer while holding a lock to ensure it doesn't race on multiple auth instances.
+func RunAWSRolesAnywhereProfileSyncerWhileLocked(ctx context.Context, params AWSRolesAnywhereProfileSyncerParams) error {
 	if err := params.checkAndSetDefaults(); err != nil {
 		return trace.Wrap(err)
 	}
 
+	runWhileLockedConfig := backend.RunWhileLockedConfig{
+		LockConfiguration: backend.LockConfiguration{
+			Backend:            params.Backend,
+			LockNameComponents: []string{"aws-roles-anywhere.profile-sync"},
+			TTL:                time.Minute,
+			RetryInterval:      params.SyncPollInterval,
+		},
+		RefreshLockInterval: 20 * time.Second,
+	}
+
+	waitWithJitter := retryutils.SeventhJitter(time.Second * 10)
 	for {
-		integrations, err := integrationsWithProfileSyncEnabled(ctx, params.Cache)
-		if err != nil {
-			return trace.Wrap(err)
-		}
-
-		proxyPublicAddr, err := fetchProxyPublicAddr(params.Cache)
-		if err != nil {
-			return trace.Wrap(err)
-		}
-
-		for _, integration := range integrations {
-			if err := syncProfileForIntegration(ctx, params, integration, proxyPublicAddr); err != nil {
-				params.Logger.ErrorContext(ctx, "failed to sync AWS Roles Anywhere Profiles for integration", "error", err)
-			}
+		err := backend.RunWhileLocked(ctx, runWhileLockedConfig, runProfileSyncer(params))
+		if err != nil && ctx.Err() == nil {
+			params.Logger.ErrorContext(
+				ctx,
+				"AWS Roles Anywhere profile syncer encountered a fatal error, it will restart after backoff",
+				"error", err,
+				"restart_after", waitWithJitter,
+			)
 		}
 
 		select {
 		case <-ctx.Done():
 			return nil
-
-		case <-params.Clock.After(params.SyncPollInterval):
+		case <-time.After(waitWithJitter):
 		}
 	}
+}
+
+func runProfileSyncer(params AWSRolesAnywhereProfileSyncerParams) func(context.Context) error {
+	return func(ctx context.Context) error {
+		for {
+			if err := profileSyncIteration(ctx, params); err != nil {
+				return trace.Wrap(err)
+			}
+
+			select {
+			case <-ctx.Done():
+				return nil
+
+			case <-params.Clock.After(params.SyncPollInterval):
+			}
+		}
+	}
+}
+
+func profileSyncIteration(ctx context.Context, params AWSRolesAnywhereProfileSyncerParams) error {
+	integrations, err := integrationsWithProfileSyncEnabled(ctx, params.Cache)
+	if err != nil {
+		return trace.Wrap(err)
+	}
+
+	if len(integrations) == 0 {
+		return nil
+	}
+
+	proxyPublicAddr, err := fetchProxyPublicAddr(params.Cache)
+	if err != nil {
+		if trace.IsNotFound(err) {
+			params.Logger.WarnContext(ctx, "AWS IAM Roles Anywhere Profile Syncer requires a Proxy which isn't available yet. It will retry again later.")
+			return nil
+		}
+
+		return trace.Wrap(err)
+	}
+
+	for _, integration := range integrations {
+		syncSummary := syncProfileForIntegration(ctx, params, integration, proxyPublicAddr)
+		if syncSummary.setupError != nil {
+			// Only log the error if there was a set up error (eg, invalid sync configuration, missing permissions, ...).
+			// Profile specific errors (eg, invalid application url) were already logged.
+			params.Logger.WarnContext(ctx, "failed to sync AWS Roles Anywhere Profiles for integration", "error", syncSummary.setupError)
+		}
+
+		integration = updateIntegrationStatus(integration, syncSummary)
+
+		if _, err := params.StatusReporter.UpdateIntegration(ctx, integration); err != nil {
+			params.Logger.ErrorContext(ctx, "failed to update integration status", "integration", integration.GetName(), "error", err)
+		}
+	}
+
+	return nil
+}
+
+func updateIntegrationStatus(integration types.Integration, syncSummary *syncSummary) types.Integration {
+	syncError := syncSummary.setupError
+	if syncError == nil {
+		syncError = trace.NewAggregate(syncSummary.profileErrors...)
+	}
+
+	status := types.IntegrationAWSRolesAnywhereProfileSyncStatusSuccess
+	if syncError != nil {
+		status = types.IntegrationAWSRolesAnywhereProfileSyncStatusError
+	}
+
+	integration.SetStatus(types.IntegrationStatusV1{
+		AWSRolesAnywhere: &types.AWSRAIntegrationStatusV1{
+			LastProfileSync: &types.AWSRolesAnywhereProfileSyncIterationSummary{
+				StartTime:      syncSummary.startTime,
+				EndTime:        syncSummary.endTime,
+				Status:         status,
+				SyncedProfiles: int32(syncSummary.syncedProfiles),
+				ErrorMessage:   truncateErrorMessage(syncError),
+			},
+		},
+	})
+
+	return integration
+}
+
+func truncateErrorMessage(err error) string {
+	if err == nil {
+		return ""
+	}
+	errorMessage := err.Error()
+
+	if len(errorMessage) <= defaults.DefaultMaxErrorMessageSize {
+		return errorMessage
+	}
+
+	return errorMessage[:defaults.DefaultMaxErrorMessageSize]
 }
 
 func fetchProxyPublicAddr(cache SyncerCache) (string, error) {
@@ -224,7 +347,7 @@ func integrationsWithProfileSyncEnabled(ctx context.Context, cache SyncerCache) 
 	return integrations, nil
 }
 
-func buildAWSRolesAnywhereClientForIntegration(ctx context.Context, params AWSRolesAnywherProfileSyncerParams, integration types.Integration) (RolesAnywhereClient, error) {
+func buildAWSRolesAnywhereClientForIntegration(ctx context.Context, params AWSRolesAnywhereProfileSyncerParams, integration types.Integration) (RolesAnywhereClient, error) {
 	trustAnchorARN := integration.GetAWSRolesAnywhereIntegrationSpec().TrustAnchorARN
 	profileSyncProfileARN := integration.GetAWSRolesAnywhereIntegrationSpec().ProfileSyncConfig.ProfileARN
 	profileSyncRoleARN := integration.GetAWSRolesAnywhereIntegrationSpec().ProfileSyncConfig.RoleARN
@@ -269,24 +392,61 @@ func buildAWSRolesAnywhereClientForIntegration(ctx context.Context, params AWSRo
 	return rolesanywhere.NewFromConfig(awsConfig), nil
 }
 
-func syncProfileForIntegration(ctx context.Context, params AWSRolesAnywherProfileSyncerParams, integration types.Integration, proxyPublicAddr string) error {
+type syncSummary struct {
+	startTime time.Time
+	endTime   time.Time
+
+	// set up error is the error that occurred while setting up the syncer
+	// Examples:
+	// - invalid Integration configuration which prevents creating the AWS SDK client (ie, invalid trust anchor ARN, profile ARN, or role ARN)
+	// - failure to generate credentials to obtain the AWS SDK client
+	// - failure to list IAM Roles Anywhere Profiles (eg, IAM Role has an invalid policy)
+	setupError error
+
+	// syncedProfiles is the number of profiles that were successfully synced.
+	syncedProfiles int
+
+	// Profile errors are errors that occurred while processing individual profiles.
+	// Examples:
+	// - failure in converting a Profile to an AppServer (eg, invalid URL)
+	// - failure creating an AppServer from a Profile
+	//
+	// Always empty if setupError is not nil.
+	profileErrors []error
+}
+
+func syncProfileForIntegration(ctx context.Context, params AWSRolesAnywhereProfileSyncerParams, integration types.Integration, proxyPublicAddr string) *syncSummary {
 	logger := params.Logger.With("integration", integration.GetName())
+
+	ret := &syncSummary{
+		startTime: params.Clock.Now(),
+	}
+
+	defer func() {
+		ret.endTime = params.Clock.Now()
+	}()
 
 	raClient, err := buildAWSRolesAnywhereClientForIntegration(ctx, params, integration)
 	if err != nil {
-		return trace.Wrap(err)
+		ret.setupError = trace.Wrap(err)
+		return ret
 	}
+
+	profileNameFilters := integration.GetAWSRolesAnywhereIntegrationSpec().ProfileSyncConfig.ProfileNameFilters
 
 	var nextPage *string
 	for {
-		profilesListResp, err := raClient.ListProfiles(ctx, &rolesanywhere.ListProfilesInput{
-			NextToken: nextPage,
-		})
+		listReq := listRolesAnywhereProfilesRequest{
+			nextPage: nextPage,
+			filters:  profileNameFilters,
+		}
+		profilesListResp, respNextToken, err := listRolesAnywhereProfilesPage(ctx, raClient, listReq)
 		if err != nil {
-			return trace.Wrap(err)
+			ret.setupError = trace.Wrap(err)
+			return ret
 		}
 
-		for _, profile := range profilesListResp.Profiles {
+		for _, profile := range profilesListResp {
 			err := processProfile(ctx, processProfileRequest{
 				Params:          params,
 				Profile:         profile,
@@ -296,21 +456,25 @@ func syncProfileForIntegration(ctx context.Context, params AWSRolesAnywherProfil
 			})
 			if err != nil {
 				if errors.Is(err, errDisabledProfile) || errors.Is(err, errProfileIsUsedForSync) {
-					logger.DebugContext(ctx, "Skipping profile", "profile_name", aws.ToString(profile.Name), "error", err.Error())
+					logger.DebugContext(ctx, "Skipping profile", "profile_name", profile.Name, "error", err.Error())
 					continue
 				}
 
-				logger.WarnContext(ctx, "Failed to process profile", "profile_name", aws.ToString(profile.Name), "error", err)
+				logger.WarnContext(ctx, "Failed to process profile", "profile_name", profile.Name, "error", err)
+				ret.profileErrors = append(ret.profileErrors, err)
+				continue
 			}
+
+			ret.syncedProfiles++
 		}
 
-		if aws.ToString(profilesListResp.NextToken) == "" {
+		if aws.ToString(respNextToken) == "" {
 			break
 		}
-		nextPage = profilesListResp.NextToken
+		nextPage = respNextToken
 	}
 
-	return nil
+	return ret
 }
 
 var (
@@ -319,8 +483,8 @@ var (
 )
 
 type processProfileRequest struct {
-	Params          AWSRolesAnywherProfileSyncerParams
-	Profile         ratypes.ProfileDetail
+	Params          AWSRolesAnywhereProfileSyncerParams
+	Profile         *integrationv1.RolesAnywhereProfile
 	RAClient        RolesAnywhereClient
 	Integration     types.Integration
 	ProxyPublicAddr string
@@ -329,22 +493,15 @@ type processProfileRequest struct {
 func processProfile(ctx context.Context, req processProfileRequest) error {
 	profileSyncProfileARN := req.Integration.GetAWSRolesAnywhereIntegrationSpec().ProfileSyncConfig.ProfileARN
 
-	if aws.ToString(req.Profile.ProfileArn) == profileSyncProfileARN {
+	if req.Profile.Arn == profileSyncProfileARN {
 		return errProfileIsUsedForSync
 	}
 
-	if !aws.ToBool(req.Profile.Enabled) {
+	if !req.Profile.Enabled {
 		return errDisabledProfile
 	}
 
-	profileTags, err := req.RAClient.ListTagsForResource(ctx, &rolesanywhere.ListTagsForResourceInput{
-		ResourceArn: req.Profile.ProfileArn,
-	})
-	if err != nil {
-		return trace.Wrap(err)
-	}
-
-	appServer, err := convertProfile(req.Params, req.Profile, req.Integration.GetName(), profileTags.Tags, req.ProxyPublicAddr)
+	appServer, err := convertProfile(req.Params, req.Profile, req.Integration.GetName(), req.ProxyPublicAddr)
 	if err != nil {
 		return trace.BadParameter("failed to convert Profile to AppServer: %v", err)
 	}
@@ -356,22 +513,20 @@ func processProfile(ctx context.Context, req processProfileRequest) error {
 	return nil
 }
 
-func convertProfile(params AWSRolesAnywherProfileSyncerParams, profile ratypes.ProfileDetail, integrationName string, profileTags []ratypes.Tag, proxyPublicAddr string) (types.AppServer, error) {
-	profileName := aws.ToString(profile.Name)
-	profileARN := aws.ToString(profile.ProfileArn)
-	parsedProfileARN, err := arn.Parse(profileARN)
+func convertProfile(params AWSRolesAnywhereProfileSyncerParams, profile *integrationv1.RolesAnywhereProfile, integrationName string, proxyPublicAddr string) (types.AppServer, error) {
+	parsedProfileARN, err := arn.Parse(profile.Arn)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
 
-	applicationName := profileName + "-" + integrationName
+	applicationName := profile.Name + "-" + integrationName
 
-	labels := make(map[string]string, len(profileTags))
-	for _, tag := range profileTags {
-		labels["aws/"+aws.ToString(tag.Key)] = aws.ToString(tag.Value)
+	labels := make(map[string]string, len(profile.Tags))
+	for tagKey, tagValue := range profile.Tags {
+		labels["aws/"+tagKey] = tagValue
 
-		if aws.ToString(tag.Key) == types.AWSRolesAnywhereProfileNameOverrideLabel {
-			applicationName = aws.ToString(tag.Value)
+		if tagKey == types.AWSRolesAnywhereProfileNameOverrideLabel {
+			applicationName = tagValue
 		}
 	}
 
@@ -380,7 +535,7 @@ func convertProfile(params AWSRolesAnywherProfileSyncerParams, profile ratypes.P
 	labels[types.AWSAccountIDLabel] = parsedProfileARN.AccountID
 	labels[constants.AWSAccountIDLabel] = parsedProfileARN.AccountID
 	labels[types.IntegrationLabel] = integrationName
-	labels[types.AWSRolesAnywhereProfileARNLabel] = profileARN
+	labels[types.AWSRolesAnywhereProfileARNLabel] = profile.Arn
 
 	// TODO(marco): add origin label in v19: teleport.dev/origin: integration_awsrolesanywhere
 	// types.Metadata.CheckAndSetDefaults in v17 returns an error if the origin label is set to AWS Roles Anywhere.
@@ -405,8 +560,8 @@ func convertProfile(params AWSRolesAnywherProfileSyncerParams, profile ratypes.P
 				PublicAddr:  appURL,
 				AWS: &types.AppAWS{
 					RolesAnywhereProfile: &types.AppAWSRolesAnywhereProfile{
-						ProfileARN:            aws.ToString(profile.ProfileArn),
-						AcceptRoleSessionName: aws.ToBool(profile.AcceptRoleSessionName),
+						ProfileARN:            profile.Arn,
+						AcceptRoleSessionName: profile.AcceptRoleSessionName,
 					},
 				},
 			},
