@@ -746,6 +746,14 @@ print-wasm-pack-version:
 	@echo $(WASM_PACK_VERSION)
 
 #
+# Print the wasm-opt version used to build Teleport.
+# Referenced from top-level Makefile ensure-wasm-opt target.
+#
+.PHONY:print-wasm-opt-version
+print-wasm-opt-version:
+	@echo $(WASM_OPT_VERSION)
+
+#
 # Print the Node version used to build Teleport Connect.
 #
 .PHONY:print-node-version
