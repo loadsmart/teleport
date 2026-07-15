@@ -9,6 +9,12 @@ GOLANGCI_LINT_VERSION ?= v2.7.2
 # NOTE: Remember to update engines.node in package.json to match the major version.
 NODE_VERSION ?= 24.16.0
 
+# Loadsmart fork: upstream moved RUST_VERSION to rust-toolchain.toml (only read by
+# top-level Makefile as RUST_TOOLCHAIN_VERSION). Sub-make invocations for
+# buildbox-centos7 still reference $(RUST_VERSION), so we re-derive it here.
+RUST_VERSION ?= $(shell awk '$$1 == "channel" && $$2 == "=" { gsub(/"/, "", $$3); print $$3 }' $(dir $(lastword $(MAKEFILE_LIST)))../rust-toolchain.toml)
+WASM_PACK_VERSION ?= 0.12.1
+
 WASM_OPT_VERSION ?= 0.116.1
 LIBBPF_VERSION ?= 1.2.2
 LIBPCSCLITE_VERSION ?= 1.9.9-teleport
