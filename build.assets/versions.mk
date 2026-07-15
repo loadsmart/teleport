@@ -16,6 +16,14 @@ RUST_VERSION ?= $(shell awk '$$1 == "channel" && $$2 == "=" { gsub(/"/, "", $$3)
 WASM_PACK_VERSION ?= 0.12.1
 
 WASM_OPT_VERSION ?= 0.116.1
+
+# Loadsmart fork: upstream moved WASM_BINDGEN_VERSION derivation into top-level
+# Makefile only. buildbox-node still needs it as a --build-arg, so re-derive it
+# here from Cargo.lock (matching upstream master's pattern).
+WASM_BINDGEN_VERSION ?= $(shell awk ' \
+	$$1 == "name" && $$3 == "\"wasm-bindgen\"" { in_pkg=1; next } \
+	in_pkg && $$1 == "version" { gsub(/"/, "", $$3); print $$3; exit } \
+' $(dir $(lastword $(MAKEFILE_LIST)))../Cargo.lock)
 LIBBPF_VERSION ?= 1.2.2
 LIBPCSCLITE_VERSION ?= 1.9.9-teleport
 
