@@ -31,6 +31,14 @@ ENV LANGUAGE="en_US.UTF-8" \
     LC_CTYPE="en_US.UTF-8" \
     DEBIAN_FRONTEND="noninteractive"
 
+# Debian Bullseye LTS ended 2026-08-31; deb.debian.org no longer serves it.
+# Point apt at the permanent archive mirror instead.
+RUN sed -i \
+    -e 's|deb.debian.org/debian-security|archive.debian.org/debian-security|g' \
+    -e 's|deb.debian.org/debian|archive.debian.org/debian|g' \
+    /etc/apt/sources.list && \
+    echo 'Acquire::Check-Valid-Until "false";' > /etc/apt/apt.conf.d/99archive
+
 # Install packages.
 RUN apt-get -y update && \
     apt-get install -q -y --no-install-recommends \
