@@ -8,7 +8,9 @@ HOSTNAME=buildbox
 SRCDIR=/go/src/github.com/gravitational/teleport
 GOMODCACHE ?= /tmp/gomodcache
 # TODO(hugoShaka) remove HELM_PLUGINS with teleport13 buildbox
-DOCKERFLAGS := --rm=true -v "$$(pwd)/../":$(SRCDIR) -v /tmp:/tmp -w $(SRCDIR) -h $(HOSTNAME) -e GOMODCACHE=$(GOMODCACHE) -e HELM_PLUGINS=/home/ci/.local/share/helm/plugins-new -e GITHUB_REPOSITORY_OWNER=$(GITHUB_REPOSITORY_OWNER) -e MAKEFLAGS -e CI=true -e TELEPORT_UPDATE_ARTIFACT_SIGNATURE_PUBLIC_KEY_B64 -e TELEPORT_UPDATE_ARTIFACT_SIGNATURE_BACKUP_PUBLIC_KEY_B64 -e TELEPORT_UPDATE_ARTIFACT_SIGNATURE_ADDITIONAL_PUBLIC_KEY_B64 -e TELEPORT_UPDATE_ARTIFACT_SIGNATURE_ADDITIONAL_BACKUP_PUBLIC_KEY_B64
+# Loadsmart does not sign teleport-update artifacts or use Teleport's self-managed-updates
+# feature, so build it unsigned rather than wiring up cosign key material.
+DOCKERFLAGS := --rm=true -v "$$(pwd)/../":$(SRCDIR) -v /tmp:/tmp -w $(SRCDIR) -h $(HOSTNAME) -e GOMODCACHE=$(GOMODCACHE) -e HELM_PLUGINS=/home/ci/.local/share/helm/plugins-new -e GITHUB_REPOSITORY_OWNER=$(GITHUB_REPOSITORY_OWNER) -e MAKEFLAGS -e CI=true -e TELEPORT_UPDATE_ARTIFACT_SIGNATURE_PUBLIC_KEY_B64 -e TELEPORT_UPDATE_ARTIFACT_SIGNATURE_BACKUP_PUBLIC_KEY_B64 -e TELEPORT_UPDATE_ARTIFACT_SIGNATURE_ADDITIONAL_PUBLIC_KEY_B64 -e TELEPORT_UPDATE_ARTIFACT_SIGNATURE_ADDITIONAL_BACKUP_PUBLIC_KEY_B64 -e TELEPORT_UPDATE_DEV_BUILD=1
 # Teleport version - some targets require this to be set
 VERSION ?= $(shell egrep ^VERSION ../Makefile | cut -d= -f2)
 
